@@ -1,0 +1,218 @@
+---
+title: "Simulation (paper), step 5: estimates of the Bayesian models"
+---
+
+Step 5 of the paper simulation (ML design): point estimates (median) and 95 % quantile intervals (QI)
+of recall, precision and F1 from every fit of step 4. The comparison with the truths follows in the
+evaluation (step 7 and `S3_Code_Simulation_Coverage.Rmd`).
+
+**Estimand:** marginal pooled and grouped value of the superpopulation of slides.
+
+- Per posterior draw the estimated recall and precision of every observed slide (with its fitted
+  slide effect; `re_formula = NULL`), expected counts E[TP] = P · recall, E[FP] = E[TP] ·
+  (1 − precision) / precision.
+- Bayesian bootstrap: Dirichlet(1, …, 1) weights over the slides (`rexp()`), new for every draw.
+  - pooled: weighted sums of the expected counts;
+  - grouped: weighted mean of the per-slide metrics.
+- Draws: all 4000 saved draws.
+
+**Seed** (offset from `01_seed_offsets.csv`)
+
+- `seed + 3000000` per fit: Dirichlet weights.
+- The mirai daemons use the L'Ecuyer-CMRG random number generator (not R's default
+  Mersenne-Twister); in a normal R session, set `RNGkind("L'Ecuyer-CMRG")` first.
+
+**Run**
+
+- Parallel with `purrr::map()` and `in_parallel()` on mirai daemons (11 workers). The functions
+  are placed on the daemons with `mirai::everywhere()`.
+- One file per fit. Fits whose estimates file exists are skipped, so the step can be restarted and
+  run while step 4 is still fitting (only existing fits are used).
+
+**Output** (`simulation/estimates/`)
+
+- `<model_id>/<scenario>_<n_slide>_v<variant>_r<rep>.csv`: estimates of one fit.
+- `05_bayes_estimates.csv.xz`: all estimates combined: `scenario`, `n_slide`, `rep`, `variant`,
+  `model`, `model_id`, `estimand`, `averaging`, `name`, `interval`, `value`, `.lower`, `.upper`.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+```
+
+# Functions
+```{r}
+# F1-score from the counts (paper eq. 3); defined if TP = 0 (paper "Case B": 0)
+calc_F1_score <- function(TP, FP, P) {
+  2 * TP / (P + TP + FP)
+}
+
+# Columns for the binomial + Poisson model and the multinomial model (as in step 3)
+prepare_brms_data <- function(df_sim) {
+  df_sim |>
+    mutate(
+      # Binomial + Poisson
+      GroundTruth = TP + FN,    # Sensitivity/recall trials: all true objects (P)
+      # Multinomial
+      N = TP + FN + FP,         # trials: all counted cells
+      Y = cbind(TP = TP, FN = FN, FP = FP),
+      # Object density, centred on the mean of log(P)
+      P_log = as.numeric(scale(log(P), center = TRUE, scale = FALSE))
+    )
+}
+
+# Per posterior draw: recall and precision of every observed slide (fitted slide effects).
+# The trials are set to 1, so .epred are probabilities (or the FP count):
+#   multinomial:        cell probabilities of TP, FN, FP
+#                       -> recall = TP / (TP + FN), precision = TP / (TP + FP)
+#   binomial + Poisson: recall (TP) and expected FP count of the slide (FP)
+#                       -> precision = recall * P / (recall * P + FP)
+epred_recall_precision <- function(fit, df_sim) {
+  newdata <- prepare_brms_data(df_sim) |>
+    select(slide, P, P_log) |>
+    mutate(GroundTruth = 1, N = 1)
+
+  df_draws <- epred_draws(fit, newdata = newdata, re_formula = NULL) |>
+    ungroup() |>
+    select(.draw, slide, P, .category, .epred) |>
+    pivot_wider(names_from = .category, values_from = .epred)
+
+  if ("FN" %in% names(df_draws)) { # Multinomial
+    df_draws |>
+      mutate(Recall = TP / (TP + FN), Precision = TP / (TP + FP)) |>
+      select(-TP, -FN, -FP)
+  } else {                         # Binomial + Poisson
+    df_draws |>
+      mutate(Recall = TP, Precision = TP * P / (TP * P + FP)) |>
+      select(-TP, -FP)
+  }
+}
+
+# Marginal estimate (model + Bayesian bootstrap): per posterior draw the expected counts of each
+# observed slide, averaged with Dirichlet(1, ..., 1) weights over the slides (new for every draw)
+#   pooled  = weighted sums of the expected counts
+#   grouped = weighted mean of the per-slide metrics
+bayes_marginal_metrics <- function(fit, df_sim) {
+  epred_recall_precision(fit, df_sim) |>
+    mutate(
+      TP = Recall * P,
+      FP = TP * (1 - Precision) / Precision
+    ) |>
+    group_by(.draw) |>
+    mutate(weight = rexp(n())) |>
+    summarise(
+      Recall_pooled     = sum(weight * TP) / sum(weight * P),
+      Precision_pooled  = sum(weight * TP) / sum(weight * (TP + FP)),
+      F1_pooled         = calc_F1_score(sum(weight * TP), sum(weight * FP), sum(weight * P)),
+      Recall_grouped    = weighted.mean(Recall, weight),
+      Precision_grouped = weighted.mean(Precision, weight),
+      F1_grouped        = weighted.mean(calc_F1_score(TP, FP, P), weight)
+    ) |>
+    pivot_longer(matches("_(pooled|grouped)$"),
+                 names_to = c("name", "averaging"), names_sep = "_") |>
+    group_by(name, averaging) |>
+    median_qi(value) |>
+    transmute(estimand = "marginal", averaging, name, interval = "qi", value, .lower, .upper)
+}
+```
+
+# Settings
+```{r}
+n_workers     <- 11
+dir_fits      <- "simulation/fits"
+dir_estimates <- "simulation/estimates"
+
+# Short model ids for the file names (as in step 4)
+df_models <- tribble(
+  ~model,              ~model_id,
+  "Binomial + Poisson", "binomial_poisson",
+  "Multinomial",        "multinomial"
+)
+```
+
+# Load data
+```{r}
+df_seed_offsets <- read_csv("simulation/data/01_seed_offsets.csv")
+df_counts       <- read_csv("simulation/data/02_ML_performance_observed_data.csv.xz")
+
+offset_bayes <- df_seed_offsets |> filter(step == "bayes_postprocessing") |> pull(offset)
+```
+
+# Jobs
+```{r}
+df_jobs <- df_counts |>
+  nest(data = c(slide, P, TP, FN, FP)) |>
+  mutate(seed_bayes = seed + offset_bayes) |>
+  cross_join(df_models) |>
+  mutate(
+    file_name      = sprintf("%s_%d_v%d_r%03d", scenario, n_slide, variant, rep),
+    file_fit       = file.path(dir_fits, model_id, paste0(file_name, ".rds")),
+    file_estimates = file.path(dir_estimates, model_id, paste0(file_name, ".csv"))
+  ) |>
+  # only existing fits without estimates
+  filter(file.exists(file_fit), !file.exists(file_estimates)) |>
+  arrange(rep, scenario, n_slide, variant, model_id)
+
+nrow(df_jobs)
+```
+
+# Estimates
+```{r}
+walk(file.path(dir_estimates, df_models$model_id), \(dir) dir.create(dir, recursive = TRUE, showWarnings = FALSE))
+
+mirai::daemons(n_workers)
+invisible(mirai::everywhere(
+  {
+    setwd(dir_project)
+    library(dplyr)
+    library(tidyr)
+    library(readr)
+    library(brms)
+    library(tidybayes)
+  },
+  dir_project = getwd(),
+  calc_F1_score = calc_F1_score, prepare_brms_data = prepare_brms_data,
+  epred_recall_precision = epred_recall_precision, bayes_marginal_metrics = bayes_marginal_metrics
+))
+
+t_start <- Sys.time()
+df_errors <- df_jobs |>
+  split(seq_len(nrow(df_jobs))) |>
+  map(in_parallel(\(job) {
+    tryCatch({
+      fit <- readRDS(job$file_fit)
+
+      set.seed(job$seed_bayes)
+      bayes_marginal_metrics(fit, job$data[[1]]) |>
+        mutate(scenario = job$scenario, n_slide = job$n_slide, rep = job$rep, variant = job$variant,
+               model = job$model, model_id = job$model_id) |>
+        select(scenario, n_slide, rep, variant, model, model_id, estimand, averaging, name,
+               interval, value, .lower, .upper) |>
+        write_csv(job$file_estimates)
+      NULL
+    }, error = \(e) tibble(file_fit = job$file_fit, error = conditionMessage(e)))
+  }), .progress = TRUE) |>
+  bind_rows()
+mirai::daemons(0)
+
+difftime(Sys.time(), t_start, units = "hours")
+
+# Failed fits (no estimates file, retried in the next run)
+df_errors
+```
+
+# Combine
+```{r}
+# Only the per-fit files in the model folders
+df_bayes_estimates <- list.files(file.path(dir_estimates, df_models$model_id), pattern = "\\.csv$",
+                                 full.names = TRUE) |>
+  read_csv()
+write_csv(df_bayes_estimates, file.path(dir_estimates, "05_bayes_estimates.csv.xz"))
+
+# Number of estimated fits per model, scenario and variant
+df_bayes_estimates |>
+  distinct(model, scenario, variant, n_slide, rep) |>
+  count(model, scenario, variant, name = "fits")
+```

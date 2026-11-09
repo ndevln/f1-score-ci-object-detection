@@ -1,0 +1,6 @@
+step,offset
+slides,0
+counts,1000000
+bootstrap,2000000
+bayes_postprocessing,3000000
+stan,4000000

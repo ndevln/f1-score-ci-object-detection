@@ -1,0 +1,228 @@
+---
+title: "Simulation (paper), step 2: generate detection counts and truths"
+---
+
+Step 2 of the paper simulation (ML design): for every dataset of step 1 and every performance variant
+the slide effects and the detection counts (TP, FN, FP) of an ML model, and the true values of
+recall, precision and F1 that the methods should estimate.
+
+**Data-generating process** (`simulate_ml_dataset()`)
+
+- Slide effects on logit recall and log FP_rate, correlated normals.
+- TP ~ Bin(P, recall_slide), FN = P - TP.
+- FP ~ Poisson(FP_rate_slide + fp_per_object · P): FP from look-alikes (independent of P) plus FP
+  that scale with the number of objects.
+
+**Performance variants**
+
+| variant | scenarios | variant_name | recall | FP_rate | fp_per_object | sd recall | sd FP_rate | cor | Purpose |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | A-C | base | 0.8 | 2 | 0.05 | 0.8 | 1.2 | 0.7 | parameters estimated from the ML model of the pathologist data |
+| 2 | A-C | FP independent of P | 0.8 | 2 | 0 | 0.8 | 1.2 | 0.7 | FP purely from look-alikes (no FP per object) |
+| 3 | A-C | higher performance | 0.9 | 1 | 0.05 | 0.8 | 1.2 | 0.7 | higher recall and precision |
+| 4 | A-C | low slide heterogeneity | 0.65 | 3.1 | 0.05 | 0.3 | 0.4 | 0.7 | small slide effects, lower performance (recall as MIDOG Model 2) |
+| 5 | D | D: baseline | 0.8 | 0.1 | 0 | 0.8 | 1.2 | 0.7 | good detector with few FP (radiology) |
+| 6 | D | D: more FP | 0.8 | 0.5 | 0 | 0.8 | 1.2 | 0.7 | as 5 with 5 times more FP |
+| 7 | D | D: conservative | 0.65 | 0.05 | 0 | 0.8 | 1.2 | 0.7 | conservative operating point: stricter threshold, lower recall (as variant 4 / MIDOG Model 2) and fewer FP |
+
+sd recall, sd FP_rate: SD of the slide effects on logit recall and log FP_rate; cor: their correlation.
+
+The FP rates of variants 1-4 (per slide, calibrated to the mitosis data) are too high for scenario D
+(1.5 objects per slide on average: precision 0.2-0.4), so scenario D has its own variants with 0.1
+or 0.5 FP per slide. Variant 6 changes the FP rate of variant 5; variant 7 is another operating
+point on the same FROC curve (a stricter threshold lowers recall and FP together).
+
+**Truth** (superpopulation of step 1, 10^6 slides per scenario, with its own slide effects per
+variant; the same truth applies to 40 and 100 slides), from the expected counts
+E[TP] = P · recall_slide, E[FP] = FP_rate_slide + fp_per_object · P:
+
+- pooled: metrics of the summed expected counts;
+- grouped: mean of the per-slide metrics.
+
+**Seeds** (offsets from `01_seed_offsets.csv`)
+
+- Counts of a dataset: `seed + 1000000 * variant`.
+- Slide effects of the superpopulation: `seed_superpop + 1000000 * variant`.
+
+**Output** (`simulation/data/`)
+
+- `02_ML_performance_variants.csv`: parameters of the performance variants.
+- `02_ML_performance_observed_data.csv.xz`: one row per slide, dataset and variant: `scenario`,
+  `n_slide`, `rep`, `seed`, `variant`, `slide`, `P`, `TP`, `FN`, `FP`. `seed` is the dataset seed of
+  step 1 (`seed_base + rep`); the later steps add their offsets from `01_seed_offsets.csv`.
+- `02_truth_superpopulation.csv`: `scenario`, `variant`, `name`, `averaging`, `truth`.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+```
+
+# Functions
+```{r}
+# F1-score from the counts (paper eq. 3); defined if TP = 0 (paper "Case B": 0)
+calc_F1_score <- function(TP, FP, P) {
+  2 * TP / (P + TP + FP)
+}
+
+# One ML dataset on the given slides.
+# recall and FP_rate refer to a slide with all slide effects = 0.
+# The slide difficulty effects on logit recall and log FP_rate are correlated normals.
+# TP ~ Bin(P, recall_slide), FN = P - TP
+# FP ~ Poisson(FP_rate_slide + fp_per_object * P): FP from look-alikes plus FP per true object
+simulate_ml_dataset <- function(
+    slides, # Slide dataset with ground truth object counts
+    recall, FP_rate, # Model performance
+    fp_per_object, # FP per true object (0: FP independent of P)
+    sd_slide_difficulty_recall, sd_slide_difficulty_FPrate, cor_slide_difficulty # Slide effects
+    ) {
+  slides |>
+    mutate(
+      recall = recall,
+      FP_rate = FP_rate,
+      # Correlated slide effects from two independent standard normals (Cholesky)
+      z_recall       = rnorm(n()),
+      z_FP_rate      = rnorm(n()),
+      effect_recall  = sd_slide_difficulty_recall * z_recall,
+      effect_FP_rate = sd_slide_difficulty_FPrate *
+        (cor_slide_difficulty * z_recall + sqrt(1 - cor_slide_difficulty^2) * z_FP_rate),
+      # True recall and expected FP of this slide
+      recall_slide      = plogis(qlogis(recall) + effect_recall),
+      FP_rate_slide     = FP_rate * exp(effect_FP_rate),
+      FP_expected_slide = FP_rate_slide + fp_per_object * P,
+      # Observed counts
+      TP = rbinom(n(), P, recall_slide),
+      FN = P - TP,
+      FP = rpois(n(), FP_expected_slide)
+    ) |>
+    select(slide, P, recall_slide, FP_expected_slide, TP, FN, FP)
+}
+
+# True metrics from the expected counts of each slide: E[TP] = P * recall_slide,
+# E[FP] = FP_expected_slide.
+#   pooled  = metric of the summed expected counts (weighted by object count)
+#   grouped = mean of the per-slide metrics (each slide same weight)
+calc_true_metrics <- function(df_sim) {
+  df_sim |>
+    mutate(TP_expected = P * recall_slide) |>
+    summarise(
+      Recall_pooled     = sum(TP_expected) / sum(P),
+      Precision_pooled  = sum(TP_expected) / sum(TP_expected + FP_expected_slide),
+      F1_pooled         = calc_F1_score(sum(TP_expected), sum(FP_expected_slide), sum(P)),
+      Recall_grouped    = mean(recall_slide),
+      Precision_grouped = mean(TP_expected / (TP_expected + FP_expected_slide)),
+      F1_grouped        = mean(calc_F1_score(TP_expected, FP_expected_slide, P))
+    ) |>
+    # long format: one row per metric (name) and averaging
+    pivot_longer(everything(), names_to = c("name", "averaging"), names_sep = "_",
+                 values_to = "truth")
+}
+```
+
+# Load slides
+```{r}
+df_slide_scenarios <- read_csv("simulation/data/01_slide_scenarios.csv")
+df_slides          <- read_csv("simulation/data/01_slides.csv.xz")
+df_slides_superpop <- read_csv("simulation/data/01_slides_superpop.csv.xz")
+df_seed_offsets    <- read_csv("simulation/data/01_seed_offsets.csv")
+
+offset_counts <- df_seed_offsets |> filter(step == "counts") |> pull(offset)
+```
+
+# Performance variants
+```{r}
+# scenario_set: the scenarios of a variant (variants 1-4: A-C, variants 5-7: D)
+df_variants <- tribble(
+  ~variant, ~scenario_set, ~variant_name,             ~recall, ~FP_rate, ~fp_per_object, ~sd_slide_difficulty_recall, ~sd_slide_difficulty_FPrate, ~cor_slide_difficulty,
+  1,        "A-C",         "base",                    0.8,     2,        0.05,           0.8,                         1.2,                         0.7,
+  2,        "A-C",         "FP independent of P",     0.8,     2,        0,              0.8,                         1.2,                         0.7,
+  3,        "A-C",         "higher performance",      0.9,     1,        0.05,           0.8,                         1.2,                         0.7,
+  4,        "A-C",         "low slide heterogeneity", 0.65,    3.1,      0.05,           0.3,                         0.4,                         0.7,
+  5,        "D",           "D: baseline",             0.8,     0.1,      0,              0.8,                         1.2,                         0.7,
+  6,        "D",           "D: more FP",              0.8,     0.5,      0,              0.8,                         1.2,                         0.7,
+  7,        "D",           "D: conservative",         0.65,    0.05,     0,              0.8,                         1.2,                         0.7
+)
+
+df_variants
+```
+
+# Generate counts
+```{r}
+# One simulation per dataset and variant of its scenario, each with its own seed
+df_counts <- df_slides |>
+  nest(slides = c(slide, group, P)) |>
+  mutate(scenario_set = if_else(scenario == "D", "D", "A-C")) |>
+  inner_join(df_variants, by = "scenario_set", relationship = "many-to-many") |>
+  mutate(
+    seed_counts = seed + offset_counts * variant,
+    sim = pmap(list(slides, seed_counts, recall, FP_rate, fp_per_object,
+                    sd_slide_difficulty_recall, sd_slide_difficulty_FPrate, cor_slide_difficulty),
+               \(slides, seed_counts, recall, FP_rate, fp_per_object,
+                 sd_slide_difficulty_recall, sd_slide_difficulty_FPrate, cor_slide_difficulty) {
+                 set.seed(seed_counts)
+                 simulate_ml_dataset(slides, recall = recall, FP_rate = FP_rate,
+                                     fp_per_object = fp_per_object,
+                                     sd_slide_difficulty_recall = sd_slide_difficulty_recall,
+                                     sd_slide_difficulty_FPrate = sd_slide_difficulty_FPrate,
+                                     cor_slide_difficulty = cor_slide_difficulty)
+               })
+  ) |>
+  select(scenario, n_slide, rep, seed, variant, sim) |>
+  unnest(sim) |>
+  # Counts (without the true per-slide values)
+  select(scenario, n_slide, rep, seed, variant, slide, P, TP, FN, FP)
+```
+
+# Truth
+```{r}
+# Superpopulation truth: superpopulation of each scenario with own slide effects per variant
+df_truth_superpop <- df_slides_superpop |>
+  nest(slides = c(slide, group, P)) |>
+  left_join(distinct(df_slide_scenarios, scenario, seed_superpop), by = "scenario") |>
+  mutate(scenario_set = if_else(scenario == "D", "D", "A-C")) |>
+  inner_join(df_variants, by = "scenario_set", relationship = "many-to-many") |>
+  mutate(
+    seed_counts = seed_superpop + offset_counts * variant,
+    truth = pmap(list(slides, seed_counts, recall, FP_rate, fp_per_object,
+                      sd_slide_difficulty_recall, sd_slide_difficulty_FPrate, cor_slide_difficulty),
+                 \(slides, seed_counts, recall, FP_rate, fp_per_object,
+                   sd_slide_difficulty_recall, sd_slide_difficulty_FPrate, cor_slide_difficulty) {
+                   set.seed(seed_counts)
+                   simulate_ml_dataset(slides, recall = recall, FP_rate = FP_rate,
+                                       fp_per_object = fp_per_object,
+                                       sd_slide_difficulty_recall = sd_slide_difficulty_recall,
+                                       sd_slide_difficulty_FPrate = sd_slide_difficulty_FPrate,
+                                       cor_slide_difficulty = cor_slide_difficulty) |>
+                     calc_true_metrics()
+                 })
+  ) |>
+  select(scenario, variant, truth) |>
+  unnest(truth)
+```
+
+# Save
+```{r}
+write_csv(df_variants, "simulation/data/02_ML_performance_variants.csv")
+write_csv(df_counts, "simulation/data/02_ML_performance_observed_data.csv.xz")
+write_csv(df_truth_superpop, "simulation/data/02_truth_superpopulation.csv")
+```
+
+# Check
+```{r}
+# Number of datasets per scenario, number of slides and variant
+df_counts |>
+  distinct(scenario, n_slide, rep, variant) |>
+  count(scenario, n_slide, variant, name = "datasets")
+
+# Superpopulation truth
+df_truth_superpop |>
+  pivot_wider(names_from = averaging, values_from = truth) |>
+  arrange(variant, name, scenario)
+
+# Scenario D: share of slides without detections per variant (Case B: precision and F1 = 0)
+df_counts |>
+  filter(scenario == "D") |>
+  group_by(variant) |>
+  summarise(no_detections = mean(TP + FP == 0), F1_slide = mean(2 * TP / (P + TP + FP)))
+```

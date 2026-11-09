@@ -1,0 +1,222 @@
+---
+title: "Simulation (paper), step 4.1: fit the Bayesian models (pathologists)"
+---
+
+Step 4.1 of the paper simulation (pathologist design): fit the compiled binomial + Poisson model of
+step 3.1 to every dataset of step 2.1 (3 scenarios × 40 slides × 2 variants × 100 replicates = 600
+datasets) and save the fits. Post-processing (estimands, intervals) follows in a later step.
+
+The fits are not part of the repository (about 1.7 GB, see `fits_pathologists/README.md`), but
+their diagnostics are.
+
+**Sampler settings** (as in step 4)
+
+- 4 chains, run one after another (`cores = 1`); the parallelisation is over the fits.
+- iter 4000, warmup 1000, thin 3: 4 × 1000 = 4000 saved draws per fit.
+- adapt_delta 0.95.
+- Diagnostics per fit: divergences, hits of the maximum tree depth, max Rhat, min bulk and tail ESS
+  (over all parameters except `lp__` and `lprior`), and Rhat, bulk and tail ESS of `lp__`.
+- Diagnostics per population-level parameter (intercepts, slide and rater SDs, correlations;
+  without the per-slide and per-rater effects): Rhat, bulk and tail ESS.
+
+**Seeds** (offset from `01_seed_offsets.csv`)
+
+- Stan: `seed + 4000000` with the dataset seed `seed` from the counts file (`seed_base + rep`).
+  All variants and models of a dataset share the seed (the data or the model differ); the ML fits
+  of step 4 use the same seeds on different data.
+
+**Run**
+
+- Parallel with `purrr::walk()` and `in_parallel()` on mirai daemons (11 workers), one job at a
+  time. The templates are sent to every daemon once (`mirai::everywhere()`) and refitted with
+  `update(recompile = FALSE)`.
+- Jobs replicate by replicate (all scenarios, variants and models of rep 1 first).
+- One file per fit. Jobs whose fit file exists are skipped, so the run can be restarted after a
+  crash or run in parts (`reps_to_fit`).
+
+**Output** (`simulation/fits_pathologists/`)
+
+- `<model_id>/<scenario>_<n_slide>_v<variant>_r<rep>.rds`: the fit (brmsfit, xz).
+- `diagnostics/<model_id>/<scenario>_<n_slide>_v<variant>_r<rep>.csv`: diagnostics of the fit
+  (or the error message if the fit failed).
+- `diagnostics_parameters/<model_id>/<scenario>_<n_slide>_v<variant>_r<rep>.csv`: diagnostics per
+  population-level parameter.
+- `04_1_fit_settings.csv`: sampler settings.
+- `04_1_fit_diagnostics.csv`, `04_1_fit_diagnostics_parameters.csv`: all diagnostics combined.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+```
+
+# Functions
+```{r}
+# Columns for the binomial + Poisson model (as in step 3.1)
+prepare_brms_data <- function(df_sim) {
+  df_sim |>
+    mutate(GroundTruth = TP + FN)    # Sensitivity/recall trials: all true objects (P)
+}
+```
+
+# Settings
+```{r}
+n_workers <- 11
+dir_fits  <- "simulation/fits_pathologists"
+
+fit_settings <- tibble(chains = 4, iter = 4000, warmup = 1000, thin = 3, adapt_delta = 0.95)
+
+# Short model ids for the file names
+df_models <- tribble(
+  ~model,               ~model_id,
+  "Binomial + Poisson", "binomial_poisson"
+)
+```
+
+# Load data
+```{r}
+df_seed_offsets <- read_csv("simulation/data/01_seed_offsets.csv")
+df_counts       <- read_csv("simulation/data/02_1_pathologist_observed_data.csv.xz")
+
+offset_stan <- df_seed_offsets |> filter(step == "stan") |> pull(offset)
+```
+
+# Jobs
+```{r}
+# Replicates to fit (a subset for a test or a partial run)
+reps_to_fit <- seq_len(max(df_counts$rep))
+
+df_jobs <- df_counts |>
+  filter(rep %in% reps_to_fit) |>
+  nest(data = c(slide, rater_ID, P, TP, FN, FP)) |>
+  mutate(seed_stan = seed + offset_stan) |>
+  cross_join(df_models) |>
+  mutate(
+    file_name        = sprintf("%s_%d_v%d_r%03d", scenario, n_slide, variant, rep),
+    file_fit         = file.path(dir_fits, model_id, paste0(file_name, ".rds")),
+    file_diagnostics = file.path(dir_fits, "diagnostics", model_id, paste0(file_name, ".csv")),
+    file_diagnostics_parameters = file.path(dir_fits, "diagnostics_parameters", model_id,
+                                            paste0(file_name, ".csv"))
+  ) |>
+  # replicate by replicate
+  arrange(rep, scenario, n_slide, variant, model_id) |>
+  # skip fits that already exist
+  filter(!file.exists(file_fit))
+
+nrow(df_jobs)
+```
+
+# Fit
+```{r}
+walk(c(file.path(dir_fits, df_models$model_id),
+       file.path(dir_fits, "diagnostics", df_models$model_id),
+       file.path(dir_fits, "diagnostics_parameters", df_models$model_id)),
+     \(dir) dir.create(dir, recursive = TRUE, showWarnings = FALSE))
+write_csv(fit_settings, file.path(dir_fits, "04_1_fit_settings.csv"))
+
+# Objects for the daemons are passed as arguments (assignments inside the expression are not kept)
+mirai::daemons(n_workers)
+invisible(mirai::everywhere(
+  {
+    setwd(dir_project)
+    library(dplyr)
+    library(readr)
+    library(brms)
+  },
+  dir_project = getwd(), prepare_brms_data = prepare_brms_data, fit_settings = fit_settings,
+  brms_templates = readRDS("simulation/models/03_1_brms_templates_pathologists.rds")
+))
+
+t_start <- Sys.time()
+df_jobs |>
+  split(seq_len(nrow(df_jobs))) |>
+  walk(in_parallel(\(job) {
+  df_diagnostics <- tryCatch({
+    t_fit <- system.time(
+      fit <- update(brms_templates[[job$model]], newdata = prepare_brms_data(job$data[[1]]),
+                    recompile = FALSE, chains = fit_settings$chains, cores = 1,
+                    iter = fit_settings$iter, warmup = fit_settings$warmup, thin = fit_settings$thin,
+                    control = list(adapt_delta = fit_settings$adapt_delta),
+                    refresh = 0, seed = job$seed_stan)
+    )[["elapsed"]]
+    # cmdstanr leaves its csv and json files in the temp folder of the worker
+    unlink(list.files(tempdir(), pattern = "\\.(csv|json)$", full.names = TRUE))
+
+    df_nuts <- nuts_params(fit)
+    df_summary_all <- posterior::summarise_draws(posterior::as_draws_array(fit), "rhat", "ess_bulk", "ess_tail")
+
+    # Diagnostics of the population-level parameters (intercepts, slide and rater SDs,
+    # correlations), without the per-slide and per-rater effects
+    job |>
+      select(scenario, n_slide, rep, variant, model, model_id) |>
+      cross_join(df_summary_all |> filter(grepl("^(b|sd|cor)_", variable))) |>
+      write_csv(job$file_diagnostics_parameters)
+
+    # Quick summary of diagnostics
+    df_summary     <- df_summary_all |> filter(!variable %in% c("lp__", "lprior"))
+    df_summary_lp  <- df_summary_all |> filter(variable == "lp__")
+
+    # Save the fit under a temporary name first, so an interrupted save leaves no fit file
+    t_save <- system.time({
+      saveRDS(fit, paste0(job$file_fit, ".tmp"), compress = "xz")
+      file.rename(paste0(job$file_fit, ".tmp"), job$file_fit)
+    })[["elapsed"]]
+
+    tibble(
+      fit_s              = t_fit,
+      save_s             = t_save,
+      divergences        = sum(df_nuts$Value[df_nuts$Parameter == "divergent__"]),
+      max_treedepth_hits = sum(df_nuts$Value[df_nuts$Parameter == "treedepth__"] >= 10),
+      max_rhat           = max(df_summary$rhat, na.rm = TRUE),
+      min_ess_bulk       = min(df_summary$ess_bulk, na.rm = TRUE),
+      min_ess_tail       = min(df_summary$ess_tail, na.rm = TRUE),
+      rhat_lp            = df_summary_lp$rhat,
+      ess_bulk_lp        = df_summary_lp$ess_bulk,
+      ess_tail_lp        = df_summary_lp$ess_tail,
+      error              = NA_character_
+    )
+  }, error = \(e) tibble(error = conditionMessage(e)))
+
+  job |>
+    select(scenario, n_slide, rep, variant, model, model_id, seed_stan) |>
+    bind_cols(df_diagnostics) |>
+    write_csv(job$file_diagnostics)
+  NULL
+}), .progress = TRUE)
+mirai::daemons(0)
+
+difftime(Sys.time(), t_start, units = "hours")
+```
+
+# Diagnostics
+```{r}
+df_fit_diagnostics <- list.files(file.path(dir_fits, "diagnostics"), pattern = "\\.csv$",
+                                 recursive = TRUE, full.names = TRUE) |>
+  read_csv(col_types = cols(error = col_character()))
+write_csv(df_fit_diagnostics, file.path(dir_fits, "04_1_fit_diagnostics.csv"))
+
+df_fit_diagnostics_parameters <- list.files(file.path(dir_fits, "diagnostics_parameters"), pattern = "\\.csv$",
+                                            recursive = TRUE, full.names = TRUE) |>
+  read_csv()
+write_csv(df_fit_diagnostics_parameters, file.path(dir_fits, "04_1_fit_diagnostics_parameters.csv"))
+
+# Failed fits
+df_fit_diagnostics |> filter(!is.na(error))
+
+# Summary per model, scenario and variant
+df_fit_diagnostics |>
+  filter(is.na(error)) |>
+  group_by(model, scenario, variant) |>
+  summarise(fits = n(), fits_with_div = sum(divergences > 0), treedepth_hits = sum(max_treedepth_hits),
+            rhat_gt_1.01 = sum(max_rhat > 1.01), max_rhat = max(max_rhat),
+            min_ess_bulk = min(min_ess_bulk), min_ess_tail = min(min_ess_tail),
+            max_rhat_lp = max(rhat_lp), min_ess_bulk_lp = min(ess_bulk_lp),
+            mean_fit_s = mean(fit_s), .groups = "drop")
+
+# Summary per model and population-level parameter
+df_fit_diagnostics_parameters |>
+  group_by(model, variant, variable) |>
+  summarise(fits = n(), rhat_gt_1.01 = sum(rhat > 1.01), max_rhat = max(rhat),
+            min_ess_bulk = min(ess_bulk), min_ess_tail = min(ess_tail), .groups = "drop")
+```

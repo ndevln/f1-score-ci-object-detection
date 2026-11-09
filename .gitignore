@@ -1,0 +1,39 @@
+# R and RStudio
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Rendering (Quarto / knitr)
+*_files/
+*.tex
+*.log
+.quarto/
+
+# Paper figures (written when rendering S1-S3)
+Figure_*.pdf
+
+# Fits of the prior sensitivity analysis (S4), refitted on the first run
+fits_04/
+
+# Simulation: Stan fits and per-fit diagnostics (too large, reproducible with the seeds);
+# the combined diagnostics and settings of step 04 are kept
+simulation/fits/*
+!simulation/fits/README.md
+!simulation/fits/04_fit_settings.csv
+!simulation/fits/04_fit_diagnostics.csv.xz
+!simulation/fits/04_fit_diagnostics_parameters.csv.xz
+simulation/fits_pathologists/*
+!simulation/fits_pathologists/README.md
+!simulation/fits_pathologists/04_1_fit_settings.csv
+!simulation/fits_pathologists/04_1_fit_diagnostics.csv
+!simulation/fits_pathologists/04_1_fit_diagnostics_parameters.csv
+
+# Simulation: per-dataset estimates of steps 05 and 06 (the combined files are kept)
+simulation/estimates/*/
+simulation/estimates_pathologists/*/
+
+# Compiled Stan models and brms templates (platform-specific, contain local paths; rebuilt by
+# steps 03 and 03_1)
+simulation/models/*.exe
+simulation/models/*.rds

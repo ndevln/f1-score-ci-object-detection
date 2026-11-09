@@ -1,0 +1,145 @@
+---
+title: "Simulation (paper), step 3: compile the Bayesian models"
+---
+
+Step 3 of the paper simulation (ML design): compile the brms models once (cmdstanr, no sampling). The
+fitting step refits these templates on every dataset with `update(recompile = FALSE)`.
+
+**Models**
+
+| Model | Recall part | Precision / FP part | Slide effects |
+| --- | --- | --- | --- |
+| Binomial + Poisson (main model) | TP ~ Bin(P, recall) | FP ~ Poisson | independent |
+| Multinomial (comparison model) | (TP, FN, FP) ~ Multinomial(N), reference TP | muFP with P_log | independent |
+
+- P_log = log(P) centred on the mean of log(P) of the dataset.
+- brms default priors, except the intercept of the FP part in the binomial + Poisson model:
+  student_t(3, 1, 2.5) on log FP. The brms default is centred on the log median FP count of the
+  data, so it would depend on the compile data.
+
+**Compile data:** scenario C, 40 slides, rep 1, variant 1. Any dataset works: Stan does not fix the
+data dimensions at compile time, so one template fits 40 and 100 slides and all scenarios.
+
+**Output** (`simulation/models/`)
+
+- The executables of the models.
+- `03_brms_templates.rds`: named list of the compiled templates.
+- `03_model_versions.csv`: R, brms, cmdstanr and CmdStan versions and the compile data.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(brms)
+```
+
+# Functions
+```{r}
+# Columns for the binomial + Poisson model (GroundTruth = P trials of the recall part) and the
+# multinomial model (Y, N, P_log)
+prepare_brms_data <- function(df_sim) {
+  df_sim |>
+    mutate(
+      # Binomial + Poisson
+      GroundTruth = TP + FN,    # Sensitivity/recall trials: all true objects (P)
+      # Multinomial
+      N = TP + FN + FP,         # trials: all counted cells
+      Y = cbind(TP = TP, FN = FN, FP = FP),
+      # Object density, centred on the mean of log(P)
+      P_log = as.numeric(scale(log(P), center = TRUE, scale = FALSE))
+    )
+}
+```
+
+# Load data
+```{r}
+df_counts <- read_csv("simulation/data/02_ML_performance_observed_data.csv.xz")
+
+df_compile <- df_counts |>
+  filter(scenario == "C", n_slide == 40, rep == 1, variant == 1) |>
+  prepare_brms_data()
+```
+
+# Models
+```{r}
+# Binomial + Poisson: TP ~ Bin(P, recall), FP ~ Poisson(mu) independent of TP,
+# independent slide effects for logit recall and log FP (no shared label)
+bf_pois_tp <- bf(TP | trials(GroundTruth) ~ 1 + (1|slide), family = binomial())
+bf_pois_fp <- bf(FP ~ 1 + (1|slide), family = poisson())
+
+# Multinomial over (TP, FN, FP) with TP as reference category: muFN = -logit(recall),
+# muFP = -logit(precision) with P_log; independent slide effects (no shared label)
+bf_mult <- bf(Y | trials(N) ~ 1,
+              muFN ~ 1 + (1|slide),
+              muFP ~ 1 + P_log + (1|slide),
+              family = multinomial(refcat = "TP"))
+
+model_formulas <- list(
+  "Binomial + Poisson" = bf_pois_tp + bf_pois_fp,
+  "Multinomial"        = bf_mult
+)
+
+# Fixed intercept prior of the FP part (the brms default depends on the data);
+# all other priors are brms defaults
+model_priors <- list(
+  "Binomial + Poisson" = prior(student_t(3, 1, 2.5), class = Intercept, resp = FP)
+)
+```
+
+# Compile
+```{r}
+dir_models <- "simulation/models"
+dir.create(dir_models, showWarnings = FALSE)
+
+# Compile once without sampling (chains = 0). The executables go into dir_models
+# (absolute path, so they are found from any working directory).
+brms_templates <- imap(model_formulas, \(formula, model)
+  brm(formula, data = df_compile, prior = model_priors[[model]],
+      backend = "cmdstanr", chains = 0, refresh = 0,
+      stan_model_args = list(dir = normalizePath(dir_models)))
+)
+```
+
+# Save
+```{r}
+saveRDS(brms_templates, file.path(dir_models, "03_brms_templates.rds"))
+
+tibble(
+  r_version        = R.version.string,
+  brms             = as.character(packageVersion("brms")),
+  cmdstanr         = as.character(packageVersion("cmdstanr")),
+  cmdstan          = cmdstanr::cmdstan_version(),
+  compile_scenario = "C",
+  compile_n_slide  = 40,
+  compile_rep      = 1,
+  compile_variant  = 1,
+  created          = format(Sys.time())
+) |>
+  write_csv(file.path(dir_models, "03_model_versions.csv"))
+```
+
+# Check: default priors of another dataset
+```{r}
+# brms writes the priors into the Stan code, and some default priors depend on the data.
+# update(recompile = FALSE) reuses the compiled executable, so every fit uses the priors of the
+# template. Compare for very different datasets (scenario A variant 4, scenario D variant 1):
+# expected difference: only the fixed FP intercept prior.
+list(A = c("A", 4), D = c("D", 1)) |>
+  map(\(x) {
+    df_check <- df_counts |>
+      filter(scenario == x[1], n_slide == 40, rep == 1, variant == as.numeric(x[2])) |>
+      prepare_brms_data()
+    imap(brms_templates, \(template, model) {
+      list(template = prior_summary(template),
+           default  = default_prior(formula(template), data = df_check)) |>
+        map(\(priors) as_tibble(priors) |> select(prior, class, coef, group, resp, dpar)) |>
+        bind_rows(.id = "source_prior") |>
+        mutate(model = model)
+    }) |>
+      bind_rows() |>
+      pivot_wider(names_from = source_prior, values_from = prior) |>
+      filter(template != default) |>
+      select(model, class, resp, dpar, group, template, default)
+  })
+```

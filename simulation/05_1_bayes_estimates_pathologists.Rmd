@@ -1,0 +1,266 @@
+---
+title: "Simulation (paper), step 5.1: estimates of the Bayesian models (pathologists)"
+---
+
+Step 5.1 of the paper simulation (pathologist design): point estimates (median) and 95 % quantile
+intervals (QI) of recall, precision and F1 from every fit of the binomial + Poisson model of step 4.1.
+The comparison with the truths of step 2.1 follows in the evaluation (step 7 and
+`S3_Code_Simulation_Coverage.Rmd`).
+
+The combined estimates are included in `simulation/estimates_pathologists/`; fits whose estimates
+exist are skipped (see Run).
+
+**Estimands** (marginal: over the slides and over the rater population)
+
+| estimand | New pathologists per draw | averaging | Truth (step 2.1) |
+| --- | --- | --- | --- |
+| `average_pathologist` | K = 200 | pooled, grouped | `02_1_truth_average_pathologist.csv` |
+| `single_pathologist` | the first of the K (a new random pathologist in every draw) | pooled, grouped | `02_1_truth_new_pathologists.csv.xz` (share of the per-rater truths inside the interval) |
+| `observed_pathologists` | none: the observed pathologists with their estimated rater effects (as in Example 1) | pooled, grouped | `02_1_truth_average_pathologist.csv` (compared with the population of pathologists) |
+
+- New pathologists: `posterior_epred()` with `allow_new_levels = TRUE, sample_new_levels =
+  "gaussian"` on the observed slides (with their estimated slide effects) × K new raters. brms draws
+  the rater effects of both parts jointly, with the rater SDs and the rater correlation of the draw,
+  and uses the same effect on all slides of a new rater (checked on one fit per model).
+- Recall and precision per cell as in `epred_recall_precision()` of step 5 (trials = 1), the expected
+  counts per cell E[TP] = P · recall, E[FP] = E[TP] · (1 − precision) / precision.
+- Bayesian bootstrap: Dirichlet(1, …, 1) weights over the slides, new for every draw, shared by all
+  pathologists of a slide (no weights over the pathologists: the new pathologists already are a
+  sample of the rater population).
+  - pooled: weighted sums of the expected counts over slides and pathologists;
+  - grouped: weighted mean of the per-cell metrics (cell = slide × pathologist).
+- K = 200 (test on one fit per model): the noise of the K random pathologists widens the intervals
+  of the average pathologist by about 2.5 % compared with K → ∞ (K = 50: about 8 %).
+- Draws: all 4000 saved draws.
+
+**Seed** (offset from `01_seed_offsets.csv`)
+
+- `seed + 3000000` per fit: new pathologists and Dirichlet weights.
+- The mirai daemons use the L'Ecuyer-CMRG random number generator (not R's default
+  Mersenne-Twister); in a normal R session, set `RNGkind("L'Ecuyer-CMRG")` first.
+
+**Run**
+
+- Parallel with `purrr::map()` and `in_parallel()` on mirai daemons (7 workers: one row per draw and
+  cell, 4000 × 8000 rows, needs about 6–8 GB per worker).
+- One file per fit. Fits whose estimates file exists are skipped, so the step can be restarted.
+
+**Output** (`simulation/estimates_pathologists/`)
+
+- `<model_id>/<scenario>_<n_slide>_v<variant>_r<rep>.csv`: estimates of one fit (new pathologists).
+- `<model_id>_observed/<scenario>_<n_slide>_v<variant>_r<rep>.csv`: estimates of one fit (observed
+  pathologists).
+- `05_1_bayes_estimates.csv.xz`: all estimates combined: `scenario`, `n_slide`, `rep`, `variant`,
+  `model`, `model_id`, `estimand`, `averaging`, `name`, `interval`, `value`, `.lower`, `.upper`.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+```
+
+# Functions
+```{r}
+# F1-score from the counts (paper eq. 3); defined if TP = 0 (paper "Case B": 0)
+calc_F1_score <- function(TP, FP, P) {
+  2 * TP / (P + TP + FP)
+}
+
+# Median and 95% quantile interval (QI) of grouped draws (column value), one row per group
+median_interval <- function(df) {
+  median_qi(df, value) |>
+    mutate(interval = "qi") |>
+    select(-.width, -.point, -.interval)
+}
+
+# Columns for the binomial + Poisson model (as in step 3.1)
+prepare_brms_data <- function(df_sim) {
+  df_sim |>
+    mutate(GroundTruth = TP + FN)    # Sensitivity/recall trials: all true objects (P)
+}
+
+# Pathologist estimates: per posterior draw K new pathologists on the observed slides
+# (with their estimated slide effects), Bayesian bootstrap weights over the slides.
+#   average_pathologist: all K new pathologists
+#   single_pathologist:  the first new pathologist only (a new random pathologist in every draw)
+# observed = TRUE: the observed pathologists with their estimated rater effects instead of new
+# pathologists (average of the observed pathologists, as in Example 1)
+#   observed_pathologists: all observed pathologists
+# Recall and expected FP count per cell (trials = 1): precision = recall * P / (recall * P + FP)
+bayes_pathologist_metrics <- function(fit, df_sim, K, observed = FALSE) {
+  df_slides <- distinct(df_sim, slide, P)
+  if (observed) {
+    newdata <- distinct(df_sim, rater_ID, slide, P)
+  } else {
+    newdata <- crossing(rater_ID = paste0("new_", seq_len(K)), df_slides)
+  }
+  newdata <- newdata |>
+    mutate(TP = 1, FN = 0, FP = 0) |>   # trials = 1: GroundTruth = 1
+    prepare_brms_data()
+
+  # Expectations per draw and cell (array draws x cells x part); every new pathologist gets
+  # new rater effects in every draw
+  e <- posterior_epred(fit, newdata = newdata, allow_new_levels = !observed,
+                       sample_new_levels = "gaussian")
+  n_draws <- dim(e)[1]
+
+  # One row per draw and cell (as.vector() of the array: the draws vary fastest)
+  df_draws <- tibble(
+    .draw    = rep(seq_len(n_draws), nrow(newdata)),
+    rater_ID = rep(newdata$rater_ID, each = n_draws),
+    slide    = rep(newdata$slide, each = n_draws),
+    P        = rep(newdata$P, each = n_draws)
+  ) |>
+    bind_cols(map(set_names(dimnames(e)[[3]]), \(part) as.vector(e[, , part])))
+  rm(e)
+
+  df_draws <- df_draws |>
+    mutate(Recall = TP, Precision = TP * P / (TP * P + FP))
+
+  # Bayesian bootstrap: Dirichlet(1, ..., 1) weights over the slides, new for every draw,
+  # shared by all pathologists of a slide
+  df_weights <- tibble(
+    .draw  = rep(seq_len(n_draws), nrow(df_slides)),
+    slide  = rep(df_slides$slide, each = n_draws),
+    weight = rexp(n_draws * nrow(df_slides))
+  )
+
+  df_draws <- df_draws |>
+    select(.draw, rater_ID, slide, P, Recall, Precision) |>
+    mutate(TP = Recall * P, FP = TP * (1 - Precision) / Precision) |>
+    left_join(df_weights, by = c(".draw", "slide"))
+
+  if (observed) {
+    df_estimands <- list(observed_pathologists = df_draws)
+  } else {
+    df_estimands <- list(average_pathologist = df_draws,
+                         single_pathologist  = df_draws |> filter(rater_ID == "new_1"))
+  }
+
+  df_estimands |>
+    imap(\(df, estimand) {
+      df |>
+        group_by(.draw) |>
+        summarise(
+          Recall_pooled     = sum(weight * TP) / sum(weight * P),
+          Precision_pooled  = sum(weight * TP) / sum(weight * (TP + FP)),
+          F1_pooled         = calc_F1_score(sum(weight * TP), sum(weight * FP), sum(weight * P)),
+          Recall_grouped    = weighted.mean(Recall, weight),
+          Precision_grouped = weighted.mean(Precision, weight),
+          F1_grouped        = weighted.mean(calc_F1_score(TP, FP, P), weight)
+        ) |>
+        pivot_longer(matches("_(pooled|grouped)$"),
+                     names_to = c("name", "averaging"), names_sep = "_") |>
+        group_by(name, averaging) |>
+        median_interval() |>
+        mutate(estimand = estimand)
+    }) |>
+    bind_rows()
+}
+```
+
+# Settings
+```{r}
+n_workers     <- 7
+K             <- 200 # new pathologists per posterior draw
+dir_fits      <- "simulation/fits_pathologists"
+dir_estimates <- "simulation/estimates_pathologists"
+
+# Short model ids for the file names (as in step 4.1)
+df_models <- tribble(
+  ~model,               ~model_id,
+  "Binomial + Poisson", "binomial_poisson"
+)
+```
+
+# Load data
+```{r}
+df_seed_offsets <- read_csv("simulation/data/01_seed_offsets.csv")
+df_counts       <- read_csv("simulation/data/02_1_pathologist_observed_data.csv.xz")
+
+offset_bayes <- df_seed_offsets |> filter(step == "bayes_postprocessing") |> pull(offset)
+```
+
+# Jobs
+```{r}
+df_jobs <- df_counts |>
+  nest(data = c(slide, rater_ID, P, TP, FN, FP)) |>
+  mutate(seed_bayes = seed + offset_bayes) |>
+  cross_join(df_models) |>
+  # new pathologists (average and single) and observed pathologists, own folders
+  cross_join(tibble(observed = c(FALSE, TRUE))) |>
+  mutate(
+    file_name      = sprintf("%s_%d_v%d_r%03d", scenario, n_slide, variant, rep),
+    file_fit       = file.path(dir_fits, model_id, paste0(file_name, ".rds")),
+    dir_output     = if_else(observed, paste0(model_id, "_observed"), model_id),
+    file_estimates = file.path(dir_estimates, dir_output, paste0(file_name, ".csv"))
+  ) |>
+  # only existing fits without estimates
+  filter(file.exists(file_fit), !file.exists(file_estimates)) |>
+  arrange(rep, scenario, n_slide, variant, model_id)
+
+nrow(df_jobs)
+```
+
+# Estimates
+```{r}
+walk(file.path(dir_estimates, c(df_models$model_id, paste0(df_models$model_id, "_observed"))),
+     \(dir) dir.create(dir, recursive = TRUE, showWarnings = FALSE))
+
+mirai::daemons(n_workers)
+invisible(mirai::everywhere(
+  {
+    setwd(dir_project)
+    library(dplyr)
+    library(tidyr)
+    library(purrr)
+    library(readr)
+    library(brms)
+    library(tidybayes)
+  },
+  dir_project = getwd(), K = K,
+  calc_F1_score = calc_F1_score, median_interval = median_interval, prepare_brms_data = prepare_brms_data,
+  bayes_pathologist_metrics = bayes_pathologist_metrics
+))
+
+t_start <- Sys.time()
+df_errors <- df_jobs |>
+  split(seq_len(nrow(df_jobs))) |>
+  map(in_parallel(\(job) {
+    tryCatch({
+      fit <- readRDS(job$file_fit)
+
+      set.seed(job$seed_bayes)
+      bayes_pathologist_metrics(fit, job$data[[1]], K, observed = job$observed) |>
+        mutate(scenario = job$scenario, n_slide = job$n_slide, rep = job$rep, variant = job$variant,
+               model = job$model, model_id = job$model_id) |>
+        select(scenario, n_slide, rep, variant, model, model_id, estimand, averaging,
+               name, interval, value, .lower, .upper) |>
+        write_csv(job$file_estimates)
+      NULL
+    }, error = \(e) tibble(file_fit = job$file_fit, error = conditionMessage(e)))
+  }), .progress = TRUE) |>
+  bind_rows()
+mirai::daemons(0)
+
+difftime(Sys.time(), t_start, units = "hours")
+
+# Failed fits (no estimates file, retried in the next run)
+df_errors
+```
+
+# Combine
+```{r}
+# Only the per-fit files in the model folders (new and observed pathologists)
+df_bayes_estimates <- list.files(file.path(dir_estimates, c(df_models$model_id,
+                                                            paste0(df_models$model_id, "_observed"))),
+                                 pattern = "\\.csv$", full.names = TRUE) |>
+  read_csv()
+write_csv(df_bayes_estimates, file.path(dir_estimates, "05_1_bayes_estimates.csv.xz"))
+
+# Number of estimated fits per model, estimand and variant
+df_bayes_estimates |>
+  distinct(model, estimand, variant, scenario, n_slide, rep) |>
+  count(model, estimand, variant, name = "fits")
+```

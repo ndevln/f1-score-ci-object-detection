@@ -1,0 +1,2 @@
+chains,iter,warmup,thin,adapt_delta,adapt_delta_D
+4,4000,1000,3,0.95,0.99

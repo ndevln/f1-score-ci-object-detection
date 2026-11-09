@@ -1,0 +1,260 @@
+---
+title: "Simulation (paper), step 6.1: bootstrap estimates (pathologists)"
+---
+
+Step 6.1 of the paper simulation (pathologist design): bootstrap estimates and 95 % quantile intervals
+(QI) of recall, precision and F1 for every dataset of step 2.1 (600 datasets) with four resampling
+schemes. The comparison with the truths of step 2.1 follows in the evaluation (step 7 and
+`S3_Code_Simulation_Coverage.Rmd`).
+
+The estimates are included in `simulation/estimates_pathologists/06_1_bootstrap_estimates.csv.xz`.
+
+**Resampling schemes** (K = 10,000 draws each, as in the example Rmds and step 6)
+
+| method | Resampled per draw | As in |
+| --- | --- | --- |
+| `row` | all rows (image × pathologist) with replacement | example, 1st chunk of the average pathologist |
+| `stratified` | the images **within** each pathologist (strata = pathologists), independently per pathologist | example, 2nd chunk and single pathologist |
+| `cluster` | the images (clusters), each with the rows of **all** pathologists | cluster bootstrap over images |
+| `two_way` | the pathologists **and** the images, independently with replacement, all combinations | two-way (pigeonhole) bootstrap for crossed designs (Owen 2007) |
+
+**Estimands** (same names as in step 5.1)
+
+- `average_pathologist`: per draw pooled / grouped over all resampled rows (`row`, `cluster`,
+  `two_way`; the `stratified` bootstrap is at the level of `row` and not used in the paper).
+- `single_pathologist`: per draw and pathologist pooled / grouped, the draws of all pathologists
+  combined into one distribution (as in the example; `stratified` and `cluster`). Not for `row` (no
+  pathologist structure) and not for `two_way` (resampling the pathologists does not change the
+  combined distribution of the per-pathologist values, so it equals `cluster`).
+
+**Metrics**
+
+- pooled: Recall = Σ TP / Σ P, Precision = Σ TP / Σ (TP + FP) (0 if there are no detections),
+  F1 = 2 Σ TP / Σ (2 TP + FN + FP).
+- grouped: mean of the per-cell metrics (cell = image × pathologist). F1 = 2 TP / (2 TP + FN + FP)
+  is always defined (P ≥ 1), precision of a cell without detections = 0 (paper "Case B").
+- `value`: median of the bootstrap draws. `value_observed`: the point estimate, i.e. the metric of
+  the original dataset (average pathologist only; name as in step 6).
+- Interval: 95 % QI (percentile interval).
+
+**Seed** (offset from `01_seed_offsets.csv`)
+
+- `seed + 2000000` per dataset (the ML bootstrap of step 6 uses the same offset on other data).
+  The four methods are drawn one after another from this seed.
+- The mirai daemons use the L'Ecuyer-CMRG random number generator (not R's default
+  Mersenne-Twister); in a normal R session, set `RNGkind("L'Ecuyer-CMRG")` first.
+
+**Run**
+
+- Parallel with `purrr::map()` and `in_parallel()` on mirai daemons, one dataset at a time. The
+  methods are computed one after another (about 10^7 rows per method for 23 pathologists).
+
+**Output** (`simulation/estimates_pathologists/`)
+
+- `06_1_bootstrap_estimates.csv.xz`: `scenario`, `n_slide`, `rep`, `variant`, `model`, `model_id`,
+  `estimand`, `averaging`, `name`, `interval`, `value`, `value_observed`, `.lower`, `.upper`
+  (same columns as `05_1_bayes_estimates.csv.xz` plus `value_observed`,
+  `model_id = "bootstrap_<method>"`).
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+```
+
+# Functions
+```{r}
+# Median and 95% quantile interval (QI) of grouped draws (column value), one row per group
+median_interval <- function(df) {
+  median_qi(df, value) |>
+    mutate(interval = "qi") |>
+    select(-.width, -.point, -.interval)
+}
+
+# Pooled and grouped metrics per group of a (grouped) data frame of cells
+calc_metrics <- function(df) {
+  df |>
+    summarise(
+      # POOLED: sum the counts first, then compute the metrics
+      Precision_pooled  = pmax(0, sum(TP) / sum(TP + FP), na.rm = TRUE), # 0 if there are no detections
+      Recall_pooled     = sum(TP) / sum(TP + FN),
+      F1_pooled         = 2 * sum(TP) / sum(2 * TP + FN + FP),
+      # GROUPED: average the per-cell metrics (each cell same weight)
+      Precision_grouped = mean(Precision),
+      Recall_grouped    = mean(Recall),
+      F1_grouped        = mean(F1),
+      .groups = "drop"
+    ) |>
+    pivot_longer(matches("_(pooled|grouped)$"), names_to = c("name", "averaging"), names_sep = "_")
+}
+
+# The four resampling schemes. Each returns one row per bootstrap draw (.draw = 1..K) and
+# resampled cell (image x pathologist), with the counts and per-cell metrics of df_cells.
+# cross_join() with .draw = 1:K gives one independent bootstrap "study" per draw (as in the example).
+
+# Row bootstrap (example, 1st chunk): all rows are resampled with replacement
+bootstrap_row <- function(df_cells, K) {
+  df_cells |>
+    cross_join(tibble(.draw = seq_len(K))) |>
+    group_by(.draw) |>
+    slice_sample(prop = 1, replace = TRUE) |>
+    ungroup()
+}
+
+# Stratified bootstrap (example, 2nd chunk and single pathologist): the images are resampled
+# within each pathologist, independently per pathologist
+bootstrap_stratified <- function(df_cells, K) {
+  df_cells |>
+    cross_join(tibble(.draw = seq_len(K))) |>
+    group_by(.draw, rater_ID) |>
+    slice_sample(prop = 1, replace = TRUE) |>
+    ungroup()
+}
+
+# Cluster bootstrap over images: the images are resampled, each with the rows of all pathologists
+bootstrap_cluster <- function(df_cells, K) {
+  distinct(df_cells, slide) |>
+    cross_join(tibble(.draw = seq_len(K))) |>
+    group_by(.draw) |>
+    slice_sample(prop = 1, replace = TRUE) |>
+    ungroup() |>
+    left_join(df_cells, by = "slide", relationship = "many-to-many")
+}
+
+# Two-way bootstrap: the images and the pathologists are resampled independently,
+# the draw contains all combinations of the resampled images and pathologists
+bootstrap_two_way <- function(df_cells, K) {
+  df_slides <- distinct(df_cells, slide) |>
+    cross_join(tibble(.draw = seq_len(K))) |>
+    group_by(.draw) |>
+    slice_sample(prop = 1, replace = TRUE) |>
+    ungroup()
+
+  df_raters <- distinct(df_cells, rater_ID) |>
+    cross_join(tibble(.draw = seq_len(K))) |>
+    group_by(.draw) |>
+    slice_sample(prop = 1, replace = TRUE) |>
+    ungroup()
+
+  inner_join(df_slides, df_raters, by = ".draw", relationship = "many-to-many") |>
+    left_join(df_cells, by = c("slide", "rater_ID"))
+}
+
+# Bootstrap of one pathologist dataset with the four resampling schemes (one after another)
+bootstrap_pathologist_metrics <- function(df_sim, K = 10000) {
+  # Per-cell metrics for grouped averaging
+  df_cells <- df_sim |>
+    mutate(
+      Precision = pmax(0, TP / (TP + FP), na.rm = TRUE), # Set to 0 if TP + FP = 0
+      Recall    = TP / (TP + FN),                         # P >= 1
+      F1        = 2 * TP / (2 * TP + FN + FP)
+    )
+
+  # Resampled datasets of the four methods (one row per draw and resampled cell),
+  # used for both estimands
+  df_draws <- list(row = bootstrap_row, stratified = bootstrap_stratified,
+                   cluster = bootstrap_cluster, two_way = bootstrap_two_way) |>
+    map(\(bootstrap) bootstrap(df_cells, K))
+
+  # Average pathologist: metrics over all resampled cells of a draw
+  df_average <- df_draws[c("row", "cluster", "two_way")] |>
+    map(\(df) df |> group_by(.draw) |> calc_metrics()) |>
+    list_rbind(names_to = "method") |>
+    mutate(estimand = "average_pathologist")
+
+  # Single pathologist: metrics per draw and pathologist, the draws of all pathologists combined
+  # (not for the row bootstrap; two_way gives the same distribution as cluster)
+  df_single <- df_draws[c("stratified", "cluster")] |>
+    map(\(df) df |> group_by(.draw, rater_ID) |> calc_metrics()) |>
+    list_rbind(names_to = "method") |>
+    mutate(estimand = "single_pathologist")
+
+  # Point estimate: the metrics of the original dataset (average pathologist)
+  df_observed <- df_cells |>
+    calc_metrics() |>
+    mutate(estimand = "average_pathologist") |>
+    rename(value_observed = value)
+
+  bind_rows(df_average, df_single) |>
+    group_by(method, estimand, name, averaging) |>
+    median_interval() |>
+    left_join(df_observed, by = c("estimand", "name", "averaging"))
+}
+```
+
+# Settings
+```{r}
+n_workers     <- 11
+K             <- 10000
+dir_estimates <- "simulation/estimates_pathologists"
+```
+
+# Load data
+```{r}
+df_seed_offsets <- read_csv("simulation/data/01_seed_offsets.csv")
+df_counts       <- read_csv("simulation/data/02_1_pathologist_observed_data.csv.xz")
+
+offset_bootstrap <- df_seed_offsets |> filter(step == "bootstrap") |> pull(offset)
+```
+
+# Jobs
+```{r}
+df_jobs <- df_counts |>
+  nest(data = c(slide, rater_ID, P, TP, FN, FP)) |>
+  mutate(seed_bootstrap = seed + offset_bootstrap) |>
+  arrange(rep, scenario, n_slide, variant)
+
+nrow(df_jobs)
+```
+
+# Bootstrap
+```{r}
+dir.create(dir_estimates, showWarnings = FALSE)
+
+mirai::daemons(n_workers)
+invisible(mirai::everywhere(
+  {
+    library(dplyr)
+    library(tidyr)
+    library(purrr)
+    library(tidybayes)
+  },
+  K = K, median_interval = median_interval, calc_metrics = calc_metrics,
+  bootstrap_row = bootstrap_row, bootstrap_stratified = bootstrap_stratified,
+  bootstrap_cluster = bootstrap_cluster, bootstrap_two_way = bootstrap_two_way,
+  bootstrap_pathologist_metrics = bootstrap_pathologist_metrics
+))
+
+t_start <- Sys.time()
+df_bootstrap_estimates <- df_jobs |>
+  split(seq_len(nrow(df_jobs))) |>
+  map(in_parallel(\(job) {
+    set.seed(job$seed_bootstrap)
+    bootstrap_pathologist_metrics(job$data[[1]], K) |>
+      mutate(scenario = job$scenario, n_slide = job$n_slide, rep = job$rep, variant = job$variant)
+  }), .progress = TRUE) |>
+  bind_rows() |>
+  mutate(model = paste0("Bootstrap, ", method), model_id = paste0("bootstrap_", method)) |>
+  select(scenario, n_slide, rep, variant, model, model_id, estimand, averaging, name, interval,
+         value, value_observed, .lower, .upper)
+mirai::daemons(0)
+
+difftime(Sys.time(), t_start, units = "mins")
+
+write_csv(df_bootstrap_estimates, file.path(dir_estimates, "06_1_bootstrap_estimates.csv.xz"))
+```
+
+# Check
+```{r}
+# Number of datasets per method, estimand and variant
+df_bootstrap_estimates |>
+  distinct(model_id, estimand, scenario, rep, variant) |>
+  count(model_id, estimand, variant, name = "datasets")
+
+# Interval width per method (F1, QI): the row bootstrap should be the narrowest
+df_bootstrap_estimates |>
+  filter(name == "F1", interval == "qi") |>
+  group_by(estimand, averaging, variant, model_id) |>
+  summarise(mean_width = mean(.upper - .lower), .groups = "drop")
+```

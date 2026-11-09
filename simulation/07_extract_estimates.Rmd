@@ -1,0 +1,206 @@
+---
+title: "Simulation (paper), step 7: extract the estimates for the evaluation"
+---
+
+Step 7 of the paper simulation: extract the estimates, truths and fit diagnostics that the evaluation
+(`S3_Code_Simulation_Coverage.Rmd`) needs into small files, joined with the truths.
+
+**Selection** (95 % QI only; point estimate = median of the bootstrap or posterior draws)
+
+| Design | Estimand | Methods | Truth |
+| --- | --- | --- | --- |
+| ML | marginal pooled / grouped (superpopulation) | slide bootstrap (pooled, grouped); Binomial + Poisson; Multinomial; Wilson (pooled recall and precision) | `02_truth_superpopulation.csv` |
+| Pathologists | average pathologist (pooled / grouped) | row, cluster and two-way bootstrap; Binomial + Poisson (new pathologists); Binomial + Poisson (observed pathologists, as in Example 1) | `02_1_truth_average_pathologist.csv` (population of pathologists) |
+| Pathologists | single pathologist (pooled / grouped) | stratified and cluster bootstrap; Binomial + Poisson | `02_1_truth_new_pathologists.csv.xz` (20,000 per-pathologist truths) |
+
+- ML design: scenarios A-D.
+- Single pathologist: the share of the per-pathologist truths inside the interval (and below / above
+  it) is computed here, so the evaluation does not need the 20,000 truths per scenario and variant.
+
+**Output: data of the evaluation** (project root, next to `S3_Code_Simulation_Coverage.Rmd`)
+
+- `S3_Data_ML_Estimates.csv.xz`: `scenario`, `n_slide`, `rep`, `variant`, `method`, `method_id`,
+  `averaging`, `name`, `value`, `.lower`, `.upper`, `truth`.
+- `S3_Data_Pathologist_Estimates.csv.xz`: `scenario`, `n_slide`, `rep`, `variant`, `estimand`,
+  `method`, `method_id`, `averaging`, `name`, `value`, `.lower`, `.upper`, `truth` (average
+  pathologist), `share_inside`, `share_below`, `share_above` (single pathologist).
+- `S3_Data_Objects_per_Image.csv`: mean number of objects per image (`mean_P`) of the
+  superpopulation per scenario.
+
+**Output: fit diagnostics** (`simulation/results/`)
+
+- `07_ML_diagnostics.csv.xz`, `07_pathologist_diagnostics.csv.xz`: fit diagnostics of the Bayesian
+  models (divergences, maximum tree depth hits, max Rhat, min bulk and tail ESS).
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+```
+
+# Settings
+```{r}
+dir_results <- "simulation/results"
+
+# Methods of the evaluation
+ml_bayes_models        <- c("binomial_poisson", "multinomial")
+pathologist_bootstraps <- tribble(
+  ~estimand,             ~model_id,
+  "average_pathologist", "bootstrap_row",
+  "average_pathologist", "bootstrap_cluster",
+  "average_pathologist", "bootstrap_two_way",
+  "single_pathologist",  "bootstrap_stratified",
+  "single_pathologist",  "bootstrap_cluster"
+)
+pathologist_bayes_models <- "binomial_poisson"
+```
+
+# ML design
+```{r}
+df_truth_superpop <- read_csv("simulation/data/02_truth_superpopulation.csv",
+                              show_col_types = FALSE)
+
+# Slide bootstrap: pooled and grouped
+df_ml_bootstrap <- read_csv("simulation/estimates/06_bootstrap_estimates.csv.xz",
+                            show_col_types = FALSE) |>
+  filter(interval == "qi", averaging %in% c("pooled", "grouped"))
+
+# Bayesian models: marginal (superpopulation) estimates. Only the needed columns are read
+# from the large file.
+df_ml_bayes <- read_csv("simulation/estimates/05_bayes_estimates.csv.xz",
+                        col_select = c(scenario, n_slide, rep, variant, model, model_id, estimand,
+                                       averaging, name, interval, value, .lower, .upper),
+                        show_col_types = FALSE) |>
+  filter(interval == "qi", estimand == "marginal", model_id %in% ml_bayes_models)
+
+# Wilson interval: pooled recall and precision
+df_ml_wilson <- read_csv("simulation/estimates/06_wilson_estimates.csv.xz",
+                         show_col_types = FALSE)
+
+bind_rows(df_ml_bootstrap, df_ml_bayes, df_ml_wilson) |>
+  left_join(df_truth_superpop, by = c("scenario", "variant", "name", "averaging")) |>
+  select(scenario, n_slide, rep, variant, method = model, method_id = model_id,
+         averaging, name, value, .lower, .upper, truth) -> df_ml_estimates
+
+# Datasets per method, averaging and metric (expected: 4,000 per scenario A-C, 3,000 for D,
+# 15,000 in total; Wilson pooled recall and precision only)
+df_ml_estimates |>
+  distinct(method, averaging, name, scenario, n_slide, rep, variant) |>
+  count(method, averaging, name, name = "datasets")
+```
+
+# Pathologist design
+```{r}
+df_truth_average <- read_csv("simulation/data/02_1_truth_average_pathologist.csv",
+                             show_col_types = FALSE)
+df_truth_new     <- read_csv("simulation/data/02_1_truth_new_pathologists.csv.xz",
+                             show_col_types = FALSE)
+
+df_path_bootstrap <- read_csv("simulation/estimates_pathologists/06_1_bootstrap_estimates.csv.xz",
+                              show_col_types = FALSE) |>
+  filter(interval == "qi") |>
+  semi_join(pathologist_bootstraps, by = c("estimand", "model_id"))
+
+# Observed pathologists (as in Example 1): a further method for the average pathologist, compared
+# with the truth of the population of pathologists
+df_path_bayes <- read_csv("simulation/estimates_pathologists/05_1_bayes_estimates.csv.xz",
+                          show_col_types = FALSE) |>
+  filter(interval == "qi", model_id %in% pathologist_bayes_models) |>
+  mutate(
+    observed = estimand == "observed_pathologists",
+    model    = if_else(observed, paste(model, "(observed pathologists)"), model),
+    model_id = if_else(observed, paste0(model_id, "_observed"), model_id),
+    estimand = if_else(observed, "average_pathologist", estimand)
+  ) |>
+  select(-observed)
+
+df_path <- bind_rows(df_path_bootstrap, df_path_bayes) |>
+  select(scenario, n_slide, rep, variant, estimand, method = model, method_id = model_id,
+         averaging, name, value, .lower, .upper)
+```
+
+Average pathologist: the truth of the population of pathologists. Single pathologist: the share
+of the 20,000 per-pathologist truths inside, below and above the interval (with the sorted truths
+per scenario, variant, metric and averaging).
+```{r}
+df_path_average <- df_path |>
+  filter(estimand == "average_pathologist") |>
+  left_join(df_truth_average, by = c("scenario", "variant", "name", "averaging"))
+
+df_path_single <- df_path |>
+  filter(estimand == "single_pathologist") |>
+  nest(intervals = -c(scenario, variant, name, averaging)) |>
+  left_join(df_truth_new |>
+              group_by(scenario, variant, name, averaging) |>
+              summarise(truths = list(sort(truth)), .groups = "drop"),
+            by = c("scenario", "variant", "name", "averaging")) |>
+  mutate(intervals = map2(intervals, truths, \(df, truths)
+    df |>
+      mutate(
+        share_below  = findInterval(.lower, truths, left.open = TRUE) / length(truths),
+        share_above  = 1 - findInterval(.upper, truths, rightmost.closed = TRUE) / length(truths),
+        share_inside = 1 - share_below - share_above
+      )
+  )) |>
+  select(-truths) |>
+  unnest(intervals)
+
+bind_rows(df_path_average, df_path_single) |>
+  select(scenario, n_slide, rep, variant, estimand, method, method_id, averaging, name,
+         value, .lower, .upper, truth, share_inside, share_below, share_above) -> df_path_estimates
+
+# Datasets per estimand, method and averaging (expected: 600 each)
+df_path_estimates |>
+  distinct(estimand, method, averaging, scenario, rep, variant) |>
+  count(estimand, method, averaging, name = "datasets")
+```
+
+# Fit diagnostics
+```{r}
+df_ml_diagnostics <- read_csv("simulation/fits/04_fit_diagnostics.csv.xz",
+                              show_col_types = FALSE) |>
+  filter(model_id %in% ml_bayes_models)
+
+df_path_diagnostics <- read_csv("simulation/fits_pathologists/04_1_fit_diagnostics.csv",
+                                show_col_types = FALSE) |>
+  filter(model_id %in% pathologist_bayes_models)
+
+list(ml = df_ml_diagnostics, pathologists = df_path_diagnostics) |>
+  map(\(df) df |>
+        select(scenario, n_slide, rep, variant, model, model_id, divergences, max_treedepth_hits,
+               max_rhat, min_ess_bulk, min_ess_tail, error)) -> diagnostics
+
+# Fits per model (expected: 16,000 per ML model for A-D, 600 pathologist fits) and failed fits
+diagnostics |>
+  map(\(df) count(df, model, failed = !is.na(error)))
+```
+
+# Objects per image
+Mean number of objects per image of the superpopulation per scenario; the evaluation orders the
+scenarios and image counts by the expected number of objects per dataset (mean P x images).
+```{r}
+read_csv("simulation/data/01_slides_superpop.csv.xz", show_col_types = FALSE) |>
+  group_by(scenario) |>
+  summarise(mean_P = mean(P)) -> df_objects_per_image
+
+df_objects_per_image
+```
+
+# Save
+```{r}
+dir.create(dir_results, showWarnings = FALSE)
+
+# Data of the evaluation (S3), next to S3_Code_Simulation_Coverage.Rmd. xz-compressed csv
+# (readr compresses by the file ending, about 6 times smaller); read_csv() reads the files directly
+write_csv(df_ml_estimates,      "S3_Data_ML_Estimates.csv.xz")
+write_csv(df_path_estimates,    "S3_Data_Pathologist_Estimates.csv.xz")
+write_csv(df_objects_per_image, "S3_Data_Objects_per_Image.csv")
+
+# Fit diagnostics
+write_csv(diagnostics$ml,           file.path(dir_results, "07_ML_diagnostics.csv.xz"))
+write_csv(diagnostics$pathologists, file.path(dir_results, "07_pathologist_diagnostics.csv.xz"))
+
+# File sizes in MB
+file.info(c(list.files(pattern = "^S3_Data_"), list.files(dir_results, full.names = TRUE)))["size"] / 1e6
+```

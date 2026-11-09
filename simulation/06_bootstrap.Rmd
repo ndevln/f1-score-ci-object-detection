@@ -1,0 +1,228 @@
+---
+title: "Simulation (paper), step 6: bootstrap estimates"
+---
+
+Step 6 of the paper simulation (ML design): bootstrap estimates and 95 % quantile intervals (QI) of
+recall, precision and F1 for every dataset of step 2, as in the example Rmds. The comparison with the
+truths follows in the evaluation (step 7 and `S3_Code_Simulation_Coverage.Rmd`).
+
+**Method**
+
+- Nonparametric bootstrap over slides: K = 10,000 draws (as in the example Rmds), each resamples
+  the slides with replacement (as many as the dataset has).
+- Per draw:
+  - `pooled`: metrics of the summed counts;
+  - `grouped`: mean of the per-slide metrics (precision of a slide without detections = 0,
+    F1 = 2 TP / (P + TP + FP), paper "Case B").
+- `value`: median of the bootstrap draws. `value_observed`: the metric of the original dataset.
+- K = 10,000: Monte Carlo error of the tail probability of each bound about ±0.16 pp, its effect
+  on the coverage negligible.
+
+This step only adds the datasets that are not in `simulation/estimates/06_bootstrap_estimates.csv.xz`
+yet.
+
+**Wilson interval** (comparison: the common interval that treats all objects as independent)
+
+- Pooled recall ΣTP / ΣP and pooled precision ΣTP / Σ(TP + FP) of the original dataset as binomial
+  proportions with the Wilson score interval (95 %); ignores the clustering of the objects in slides.
+- No F1 (not a binomial proportion), no grouped estimand. No resampling: computed for all datasets
+  (A-D) in seconds, without a seed.
+
+**Seed** (offset from `01_seed_offsets.csv`)
+
+- `seed + 2000000` per dataset.
+- The mirai daemons use the L'Ecuyer-CMRG random number generator (not R's default
+  Mersenne-Twister); in a normal R session, set `RNGkind("L'Ecuyer-CMRG")` first.
+
+**Run**
+
+- Parallel with `purrr::map()` and `in_parallel()` on mirai daemons, one dataset at a time.
+
+**Output** (`simulation/estimates/`)
+
+- `06_bootstrap_estimates.csv.xz`: `scenario`, `n_slide`, `rep`, `variant`, `model`, `model_id`,
+  `estimand`, `averaging`, `name`, `interval`, `value`, `value_observed`, `.lower`, `.upper`
+  (`model_id = "bootstrap"`).
+- `06_wilson_estimates.csv.xz`: the same columns (`model_id = "wilson"`, `averaging = "pooled"`,
+  `interval = "wilson"`, `value` = `value_observed` = observed proportion).
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+```
+
+# Functions
+```{r}
+# F1-score from the counts (paper eq. 3); defined if TP = 0 (paper "Case B": 0)
+calc_F1_score <- function(TP, FP, P) {
+  2 * TP / (P + TP + FP)
+}
+
+# Pooled and grouped bootstrap of one dataset (as in the example Rmds).
+# .draw = 0 is the original dataset (observed value), .draw = 1..K the bootstrap draws.
+bootstrap_metrics <- function(df_sim, K = 10000) {
+  n_slide <- nrow(df_sim)
+  df_draws <- bind_rows(
+    df_sim |> mutate(.draw = 0L),
+    # Resample the slides with replacement up to the original number of slides
+    tibble(.draw = rep(seq_len(K), each = n_slide),
+           slide = sample(df_sim$slide, K * n_slide, replace = TRUE)) |>
+      left_join(df_sim, by = "slide")
+  )
+
+  df_metrics <- df_draws |>
+    # Per-slide metrics for grouped averaging
+    mutate(
+      Precision_slide = pmax(0, TP / (TP + FP), na.rm = TRUE), # 0 if TP + FP = 0
+      Recall_slide    = TP / P,
+      F1_slide        = calc_F1_score(TP, FP, P)
+    ) |>
+    group_by(.draw) |>
+    summarise(
+      # POOLED: sum the counts first, then compute the metrics
+      Precision_pooled = pmax(0, sum(TP) / sum(TP + FP), na.rm = TRUE),
+      Recall_pooled    = sum(TP) / sum(P),
+      F1_pooled        = calc_F1_score(sum(TP), sum(FP), sum(P)),
+      # GROUPED: average the per-slide metrics (each slide same weight)
+      Precision_grouped = mean(Precision_slide),
+      Recall_grouped    = mean(Recall_slide),
+      F1_grouped        = mean(F1_slide)
+    ) |>
+    pivot_longer(-.draw, names_to = c("name", "averaging"), names_sep = "_")
+
+  df_metrics |>
+    filter(.draw > 0) |>
+    group_by(name, averaging) |>
+    median_qi(value) |>
+    mutate(interval = "qi") |>
+    select(name, averaging, interval, value, .lower, .upper) |>
+    left_join(df_metrics |> filter(.draw == 0) |> select(name, averaging, value_observed = value),
+              by = c("name", "averaging"))
+}
+```
+
+# Settings
+```{r}
+n_workers      <- 11
+dir_estimates  <- "simulation/estimates"
+file_bootstrap <- file.path(dir_estimates, "06_bootstrap_estimates.csv.xz")
+file_wilson    <- file.path(dir_estimates, "06_wilson_estimates.csv.xz")
+```
+
+# Load data
+```{r}
+df_seed_offsets <- read_csv("simulation/data/01_seed_offsets.csv")
+df_counts       <- read_csv("simulation/data/02_ML_performance_observed_data.csv.xz")
+
+offset_bootstrap <- df_seed_offsets |> filter(step == "bootstrap") |> pull(offset)
+
+# Existing estimates; only the missing datasets are bootstrapped
+df_bootstrap_existing <- if (file.exists(file_bootstrap)) read_csv(file_bootstrap) else NULL
+df_done <- if (is.null(df_bootstrap_existing)) {
+  df_counts |> distinct(scenario, n_slide, rep, variant) |> filter(FALSE)   # no dataset done
+} else {
+  df_bootstrap_existing |> distinct(scenario, n_slide, rep, variant)
+}
+```
+
+# Jobs
+```{r}
+df_jobs <- df_counts |>
+  nest(data = c(slide, P, TP, FN, FP)) |>
+  mutate(seed_bootstrap = seed + offset_bootstrap) |>
+  anti_join(df_done, by = c("scenario", "n_slide", "rep", "variant")) |>
+  arrange(rep, scenario, n_slide, variant)
+
+nrow(df_jobs)
+```
+
+# Bootstrap
+```{r}
+dir.create(dir_estimates, showWarnings = FALSE)
+
+mirai::daemons(n_workers)
+invisible(mirai::everywhere(
+  {
+    library(dplyr)
+    library(tidyr)
+    library(tidybayes)
+  },
+  calc_F1_score = calc_F1_score, bootstrap_metrics = bootstrap_metrics
+))
+
+t_start <- Sys.time()
+df_bootstrap_new <- df_jobs |>
+  split(seq_len(nrow(df_jobs))) |>
+  map(in_parallel(\(job) {
+    set.seed(job$seed_bootstrap)
+    bootstrap_metrics(job$data[[1]]) |>
+      mutate(scenario = job$scenario, n_slide = job$n_slide, rep = job$rep, variant = job$variant)
+  }), .progress = TRUE) |>
+  bind_rows() |>
+  mutate(model = "Bootstrap", model_id = "bootstrap", estimand = "bootstrap")
+mirai::daemons(0)
+
+difftime(Sys.time(), t_start, units = "mins")
+
+df_bootstrap_estimates <- bind_rows(df_bootstrap_existing, df_bootstrap_new) |>
+  select(scenario, n_slide, rep, variant, model, model_id, estimand, averaging, name, interval,
+         value, value_observed, .lower, .upper)
+write_csv(df_bootstrap_estimates, file_bootstrap)
+```
+
+# Wilson interval
+Wilson score interval of a proportion x / n:
+$\tilde p \pm \frac{z}{1 + z^2/n} \sqrt{\hat p (1 - \hat p) / n + z^2 / (4 n^2)}$ with the centre
+$\tilde p = (\hat p + z^2 / (2n)) / (1 + z^2 / n)$, $\hat p = x / n$ and $z = 1.96$.
+```{r wilson}
+z <- qnorm(0.975)
+
+df_counts |>
+  group_by(scenario, n_slide, rep, variant) |>
+  # n of recall and precision first (TP is overwritten by its sum afterwards)
+  summarise(Recall = sum(P), Precision = sum(TP + FP), TP = sum(TP), .groups = "drop") |>
+  pivot_longer(c(Recall, Precision), names_to = "name", values_to = "n") |>
+  mutate(
+    value  = TP / n,
+    center = (value + z^2 / (2 * n)) / (1 + z^2 / n),
+    half   = z / (1 + z^2 / n) * sqrt(value * (1 - value) / n + z^2 / (4 * n^2)),
+    .lower = center - half,
+    .upper = center + half,
+    value_observed = value,
+    model = "Wilson", model_id = "wilson", estimand = "wilson", averaging = "pooled",
+    interval = "wilson"
+  ) |>
+  select(scenario, n_slide, rep, variant, model, model_id, estimand, averaging, name, interval,
+         value, value_observed, .lower, .upper) -> df_wilson_estimates
+
+write_csv(df_wilson_estimates, file_wilson)
+```
+
+```{r wilson-check}
+# Datasets per scenario and metric, intervals that are not defined (n = 0)
+df_wilson_estimates |>
+  count(scenario, name, undefined = is.na(.lower), name = "datasets")
+
+# The observed proportions equal the observed pooled values of the bootstrap (expected: 0)
+read_csv(file_bootstrap) |>
+  filter(averaging == "pooled") |>
+  inner_join(df_wilson_estimates, by = c("scenario", "n_slide", "rep", "variant", "name")) |>
+  summarise(datasets = n(), max_abs_diff = max(abs(value_observed.x - value_observed.y)))
+```
+
+# Check
+```{r}
+# Number of datasets per scenario, slide count and variant
+df_bootstrap_estimates |>
+  distinct(scenario, n_slide, rep, variant) |>
+  count(scenario, n_slide, variant, name = "datasets")
+
+# Median of the bootstrap vs. observed value (should be close; F1)
+df_bootstrap_estimates |>
+  filter(name == "F1") |>
+  group_by(scenario, n_slide, averaging) |>
+  summarise(mean_diff = mean(value - value_observed), max_abs_diff = max(abs(value - value_observed)),
+            mean_width = mean(.upper - .lower), .groups = "drop")
+```

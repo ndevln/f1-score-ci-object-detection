@@ -1,0 +1,9 @@
+scenario,n_slide,description,median_low,sd_low,w,median_high,sd_high,P_max,n_rep,seed_base,n_superpop,seed_superpop,r_version,rng_kind,created
+A,40,low only,3,0.5,0,NA,NA,300,500,110000,1000000,900001,R version 4.6.1 (2026-06-24 ucrt),Mersenne-Twister / Inversion / Rejection,2026-11-07
+A,100,low only,3,0.5,0,NA,NA,300,500,120000,1000000,900001,R version 4.6.1 (2026-06-24 ucrt),Mersenne-Twister / Inversion / Rejection,2026-11-07
+B,40,broad (like MIDOG),19,1,0,NA,NA,300,500,210000,1000000,900002,R version 4.6.1 (2026-06-24 ucrt),Mersenne-Twister / Inversion / Rejection,2026-11-07
+B,100,broad (like MIDOG),19,1,0,NA,NA,300,500,220000,1000000,900002,R version 4.6.1 (2026-06-24 ucrt),Mersenne-Twister / Inversion / Rejection,2026-11-07
+C,40,bimodal (like pathologists),15,1,0.2,215,0.15,300,500,310000,1000000,900003,R version 4.6.1 (2026-06-24 ucrt),Mersenne-Twister / Inversion / Rejection,2026-11-07
+C,100,bimodal (like pathologists),15,1,0.2,215,0.15,300,500,320000,1000000,900003,R version 4.6.1 (2026-06-24 ucrt),Mersenne-Twister / Inversion / Rejection,2026-11-07
+D,40,very low,0.5,0,0,NA,NA,Inf,500,410000,1000000,900004,R version 4.6.1 (2026-06-24 ucrt),Mersenne-Twister / Inversion / Rejection,2026-11-07
+D,100,very low,0.5,0,0,NA,NA,Inf,500,420000,1000000,900004,R version 4.6.1 (2026-06-24 ucrt),Mersenne-Twister / Inversion / Rejection,2026-11-07

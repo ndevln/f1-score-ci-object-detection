@@ -1,0 +1,199 @@
+---
+title: "Simulation (paper), step 1: generate slides"
+---
+
+Step 1 of the paper simulation: the slides (images) of all simulated datasets with their number of
+ground-truth objects P. Later steps add the detection counts (TP, FN, FP) for the performance
+variants and fit the models.
+
+**Design**
+
+- Four slide distributions (scenarios), each with 40 and 100 slides per dataset:
+  - **A, low only:** few objects per slide (median about 4).
+  - **B, broad:** wide range of objects per slide, like the MIDOG data (median about 20).
+  - **C, bimodal:** like the pathologist data: slides with a moderate number of objects (median about 15)
+    plus a group of slides with many objects (about 215).
+  - **D, very low:** P = 1 + Poisson(0.5) (P = 1, 2, 3, 4+ with probability 0.607, 0.303, 0.076,
+    0.014), as in radiology (one lesion per image is the typical case).
+- P = 1 + Poisson(exp(x)), x normal on the log scale (D: x = log(0.5) for all slides); slides with
+  more than P_max objects are drawn again (A-C: P_max = 300, D: no upper limit).
+- 500 replicates (datasets) per scenario and number of slides; the 40- and 100-slide datasets are
+  drawn independently (unpaired).
+- Every dataset has its own seed (`seed = seed_base + rep`), so a single dataset can be regenerated
+  without the others.
+
+**Seed scheme for all steps** (`01_seed_offsets.csv`)
+
+Every random step gets its own seed, derived from the dataset seed with a fixed offset.
+
+| Step | Seed |
+| --- | --- |
+| Slides (this file) | `seed` |
+| Counts (TP, FN, FP) per performance variant | `seed + 1000000 * variant` |
+| Bootstrap | `seed + 2000000` |
+| Bayesian post-processing (Bayesian bootstrap, new raters) | `seed + 3000000` |
+| Stan sampling | `seed + 4000000` |
+
+**Output** (`simulation/data/`)
+
+- `01_slide_scenarios.csv`: one row per scenario and number of slides with the parameters of
+  `simulate_slides()`, the number of replicates, `seed_base` and metadata (R version, RNG kind, date).
+- `01_slides.csv.xz`: long format, one row per slide: `scenario`, `n_slide`, `rep`, `seed`, `slide`, `group`, `P`.
+- `01_seed_offsets.csv`: the seed offsets of all steps (table above).
+- `01_slides_superpop.csv.xz`: the superpopulation of slides per scenario (10^6 slides, same parameters,
+  own seed `seed_superpop`): `scenario`, `slide`, `group`, `P`. It is the basis of the population truth;
+  the same superpopulation is used for 40 and 100 slides.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(ggplot2)
+```
+
+# Functions
+```{r}
+# Generate images/slides with a random number of ground truth objects.
+# Each slide is in the "high" group with probability w, otherwise "low" (w = 0 gives a single
+# group); P = 1 + Poisson(exp(x)) with x ~ Normal(log(median), sd) of the slide's group (the shift
+# by 1 excludes P = 0; sd = 0 gives a plain Poisson). Slides with more than P_max objects are drawn
+# again (truncated distribution, no spike at P_max).
+simulate_slides <- function(n_slide, median_low, sd_low,
+                            w = 0, median_high = NA, sd_high = NA, P_max = Inf) {
+  df_slides <- tibble(
+    slide = seq_len(n_slide),
+    # For w > 0 simulate a bimodal distribution of objects per slide
+    group = sample(c("high", "low"), n_slide, replace = TRUE, prob = c(w, 1 - w)),
+    log_median = log(if_else(group == "high", median_high, median_low)),
+    log_sd     = if_else(group == "high", sd_high, sd_low),
+    P          = rpois(n_slide, exp(rnorm(n_slide, log_median, log_sd))) + 1L
+  )
+
+  # Redraw slides above P_max (same group)
+  while (any(df_slides$P > P_max)) {
+    df_slides <- df_slides |>
+      mutate(P = if_else(P > P_max, rpois(n(), exp(rnorm(n(), log_median, log_sd))) + 1L, P))
+  }
+
+  df_slides |>
+    select(slide, group, P)
+}
+```
+
+# Design
+```{r}
+# Slide distributions (parameters of simulate_slides()); seed_base per scenario and number of
+# slides, the seed of a dataset is seed_base + rep
+n_rep <- 500
+scenarios <- c("A", "B", "C", "D")
+
+df_slide_scenarios <- tribble(
+  ~scenario, ~description,                  ~median_low, ~sd_low, ~w,  ~median_high, ~sd_high, ~P_max,
+  "A",       "low only",                    3,           0.5,     0,   NA,           NA,       300,
+  "B",       "broad (like MIDOG)",          19,          1,       0,   NA,           NA,       300,
+  "C",       "bimodal (like pathologists)", 15,          1,       0.2, 215,          0.15,     300,
+  "D",       "very low",                    0.5,         0,       0,   NA,           NA,       Inf
+) |>
+  cross_join(tibble(n_slide = c(40, 100))) |>
+  mutate(
+    n_rep = n_rep,
+    seed_base = 100000 * match(scenario, scenarios) + 10000 * if_else(n_slide == 40, 1, 2),
+    # Superpopulation (one per scenario, the same for both numbers of slides)
+    n_superpop = 1e6,
+    seed_superpop = 900000 + match(scenario, scenarios),
+    # Metadata for reproducibility
+    r_version = R.version.string,
+    rng_kind = paste(RNGkind(), collapse = " / "),
+    created = format(Sys.Date())
+  ) |>
+  relocate(scenario, n_slide)
+
+df_slide_scenarios
+
+# Offsets of the seed per random step (seed of a step = seed + offset; counts: offset * variant)
+df_seed_offsets <- tribble(
+  ~step,                ~offset,
+  "slides",               0,
+  "counts",               1000000,
+  "bootstrap",            2000000,
+  "bayes_postprocessing", 3000000,
+  "stan",                 4000000
+)
+```
+
+# Generate slides
+```{r}
+# One dataset per scenario, number of slides and replicate, each with its own seed
+df_slides <- df_slide_scenarios |>
+  select(scenario, n_slide, median_low, sd_low, w, median_high, sd_high, P_max, seed_base) |>
+  cross_join(tibble(rep = seq_len(n_rep))) |>
+  mutate(seed = seed_base + rep) |>
+  mutate(slides = pmap(list(seed, n_slide, median_low, sd_low, w, median_high, sd_high, P_max),
+                       \(seed, n_slide, median_low, sd_low, w, median_high, sd_high, P_max) {
+                         set.seed(seed)
+                         simulate_slides(n_slide, median_low = median_low, sd_low = sd_low,
+                                         w = w, median_high = median_high, sd_high = sd_high,
+                                         P_max = P_max)
+                       })) |>
+  select(scenario, n_slide, rep, seed, slides) |>
+  unnest(slides)
+```
+
+# Generate superpopulation
+```{r}
+# 10^6 slides per scenario with the same parameters and an own seed, basis of the population truth
+df_slides_superpop <- df_slide_scenarios |>
+  distinct(scenario, median_low, sd_low, w, median_high, sd_high, P_max, n_superpop, seed_superpop) |>
+  mutate(slides = pmap(list(seed_superpop, n_superpop, median_low, sd_low, w, median_high, sd_high, P_max),
+                       \(seed, n_slide, median_low, sd_low, w, median_high, sd_high, P_max) {
+                         set.seed(seed)
+                         simulate_slides(n_slide, median_low = median_low, sd_low = sd_low,
+                                         w = w, median_high = median_high, sd_high = sd_high,
+                                         P_max = P_max)
+                       })) |>
+  select(scenario, slides) |>
+  unnest(slides)
+```
+
+# Save
+```{r}
+dir.create("simulation/data", showWarnings = FALSE, recursive = TRUE)
+write_csv(df_slide_scenarios, "simulation/data/01_slide_scenarios.csv")
+write_csv(df_slides, "simulation/data/01_slides.csv.xz")
+write_csv(df_seed_offsets, "simulation/data/01_seed_offsets.csv")
+# xz compression (from the file extension)
+write_csv(df_slides_superpop, "simulation/data/01_slides_superpop.csv.xz")
+```
+
+# Check
+```{r}
+# Number of datasets and slides per scenario and number of slides
+df_slides |>
+  group_by(scenario, n_slide) |>
+  summarise(datasets = n_distinct(rep), slides = n(), seeds = n_distinct(seed),
+            share_high = mean(group == "high"), .groups = "drop")
+
+# Distribution of P per scenario and number of slides
+df_slides |>
+  group_by(scenario, n_slide) |>
+  summarise(min = min(P), q05 = quantile(P, 0.05), median = median(P), mean = mean(P),
+            q95 = quantile(P, 0.95), max = max(P), share_P_le_3 = mean(P <= 3), .groups = "drop")
+
+df_slides |>
+  ggplot(aes(P)) +
+  geom_histogram(bins = 40) +
+  scale_x_log10() +
+  facet_grid(scenario ~ n_slide, scales = "free") +
+  theme_bw()
+
+# Superpopulation vs. all datasets of a scenario: the distributions of P should agree
+bind_rows(
+  df_slides |> mutate(source = paste(n_slide, "slides, all datasets")),
+  df_slides_superpop |> mutate(source = "superpopulation")
+) |>
+  group_by(scenario, source) |>
+  summarise(slides = n(), q05 = quantile(P, 0.05), q25 = quantile(P, 0.25), median = median(P),
+            q75 = quantile(P, 0.75), q95 = quantile(P, 0.95), max = max(P),
+            share_high = mean(group == "high"), .groups = "drop")
+```

@@ -1,0 +1,3 @@
+variant,variant_name,n_rater,recall,FP_rate,fp_per_object,sd_slide_difficulty_recall,sd_slide_difficulty_FPrate,cor_slide_difficulty,sd_rater_skill,sd_rater_cutoff,rater_FP_scale
+1,data example,23,0.63,4.2,0.015,0.66,0.95,0,0.2,0.55,2
+2,skilled panel,9,0.7,3,0.015,0.66,0.95,0,0.55,0.2,2

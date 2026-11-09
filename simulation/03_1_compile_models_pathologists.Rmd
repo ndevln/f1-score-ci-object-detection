@@ -1,0 +1,140 @@
+---
+title: "Simulation (paper), step 3.1: compile the Bayesian models (pathologists)"
+---
+
+Step 3.1 of the paper simulation (pathologist design): compile the brms model once (cmdstanr, no
+sampling). The fitting step refits the template on every dataset with `update(recompile = FALSE)`.
+
+**Model** (slide and rater effects, every rater scores every slide): binomial + Poisson,
+TP ~ Bin(P, recall), FP ~ Poisson, independent slide effects, rater effects correlated between the
+parts (skill and cutoff move recall and FP together).
+
+- brms default priors, except the intercept of the FP part: student_t(3, 1, 2.5) on log FP, as in
+  step 3 (the brms default depends on the compile data).
+
+**Compile data:** scenario C, 40 slides, rep 1, variant 1 (data example). Stan does not fix the data
+dimensions at compile time, so one template fits both variants (23 and 9 raters).
+
+**Output** (`simulation/models/`)
+
+- The executables of the models (ignored by git, rebuilt by this step).
+- `03_1_brms_templates_pathologists.rds`: named list of the compiled templates.
+- `03_1_model_versions.csv`: R, brms, cmdstanr and CmdStan versions and the compile data.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+library(brms)
+```
+
+# Functions
+```{r}
+# Columns for the binomial + Poisson model
+prepare_brms_data <- function(df_sim) {
+  df_sim |>
+    mutate(GroundTruth = TP + FN)    # Sensitivity/recall trials: all true objects (P)
+}
+```
+
+# Load data
+```{r}
+df_counts <- read_csv("simulation/data/02_1_pathologist_observed_data.csv.xz")
+
+df_compile <- df_counts |>
+  filter(scenario == "C", rep == 1, variant == 1) |>
+  prepare_brms_data()
+```
+
+# Models
+```{r}
+# Binomial + Poisson: TP ~ Bin(P, recall), FP ~ Poisson(mu) independent of TP,
+# independent slide effects, correlated rater effects (shared label r)
+bf_pois_tp <- bf(TP | trials(GroundTruth) ~ 1 + (1|slide) + (1|r|rater_ID), family = binomial())
+bf_pois_fp <- bf(FP ~ 1 + (1|slide) + (1|r|rater_ID), family = poisson())
+
+model_formulas <- list(
+  "Binomial + Poisson" = bf_pois_tp + bf_pois_fp
+)
+
+# Fixed intercept prior of the FP part (the brms default depends on the data);
+# all other priors are brms defaults
+model_priors <- list(
+  "Binomial + Poisson" = prior(student_t(3, 1, 2.5), class = Intercept, resp = FP)
+)
+```
+
+# Compile
+```{r}
+dir_models <- "simulation/models"
+dir.create(dir_models, showWarnings = FALSE)
+
+# Compile once without sampling (chains = 0). The executables go into dir_models
+# (absolute path, so they are found from any working directory).
+# With cmdstanr, chains = 0 still runs 1 chain with 1 iteration, hence the
+# divergence and E-BFMI warnings.
+brms_templates <- imap(model_formulas, \(formula, model)
+  brm(formula, data = df_compile, prior = model_priors[[model]],
+      backend = "cmdstanr", chains = 0, refresh = 0,
+      stan_model_args = list(dir = normalizePath(dir_models)))
+)
+```
+
+# Save
+```{r}
+saveRDS(brms_templates, file.path(dir_models, "03_1_brms_templates_pathologists.rds"))
+
+tibble(
+  r_version        = R.version.string,
+  brms             = as.character(packageVersion("brms")),
+  cmdstanr         = as.character(packageVersion("cmdstanr")),
+  cmdstan          = cmdstanr::cmdstan_version(),
+  compile_scenario = "C",
+  compile_n_slide  = 40,
+  compile_rep      = 1,
+  compile_variant  = 1,
+  created          = format(Sys.time())
+) |>
+  write_csv(file.path(dir_models, "03_1_model_versions.csv"))
+```
+
+# Load
+```{r}
+# Saved templates: the check also runs without compiling again
+brms_templates <- readRDS("simulation/models/03_1_brms_templates_pathologists.rds")
+```
+
+# Check: default priors of another dataset
+```{r}
+# update(recompile = FALSE) reuses the compiled executable, so every fit uses the priors of the
+# template. Compare for a very different dataset (scenario A, variant 2):
+#   template = priors of the template (compile data)
+#   default  = default priors brms would choose for df_check
+df_check <- df_counts |>
+  filter(scenario == "A", rep == 1, variant == 2) |>
+  prepare_brms_data()
+
+df_prior_check <- imap(brms_templates, \(template, model) {
+  list(
+    template = prior_summary(template),
+    default  = default_prior(formula(template), data = df_check)
+  ) |>
+    map(\(priors) as_tibble(priors) |> select(prior, class, coef, group, resp, dpar)) |>
+    bind_rows(.id = "source_prior") |>
+    mutate(model = model)
+}) |>
+  bind_rows() |>
+  pivot_wider(names_from = source_prior, values_from = prior)
+
+# Priors that differ between the template and the defaults for df_check
+# (expected: only the fixed FP intercept prior)
+df_prior_check |>
+  filter(template != default) |>
+  select(model, class, resp, dpar, group, template, default)
+
+# All priors of the templates
+df_prior_check |>
+  select(model, class, resp, group, coef, template) |>
+  print(n = Inf)
+```

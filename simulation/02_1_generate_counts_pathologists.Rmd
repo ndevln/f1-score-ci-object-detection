@@ -1,0 +1,294 @@
+---
+title: "Simulation (paper), step 2.1: generate pathologist counts and truths"
+---
+
+Step 2.1 of the paper simulation (pathologist design): for the datasets of step 1 with 40 slides
+(scenarios A-C, replicates 1–100) and every pathologist variant, the slide and rater effects and the
+detection counts (TP, FN, FP) of every rater on every slide, and the true values of recall,
+precision and F1 for the average pathologist and for single pathologists.
+
+**Data-generating process** (`simulate_rater_dataset()`)
+
+- Slide effects on logit recall and log FP_rate, shared by all raters of a slide.
+- Rater effects from two independent parts: skill s ~ N(0, σ_skill) (better on both) and cutoff
+  c ~ N(0, σ_cutoff) (more liberal: higher recall, more FP).
+  Effect on logit recall = s + c, effect on log FP_rate = g · (c − s).
+- Every rater scores every slide: TP ~ Bin(P, recall_cell), FN = P − TP,
+  FP ~ Poisson(FP_rate_cell + fp_per_object · P). No rater × slide effect.
+- New raters for every dataset (the rater population is part of the estimand).
+
+**Variants**
+
+| Variant | Raters | recall | FP_rate | fp_per_object | σ_skill | σ_cutoff | g | Purpose |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 data example | 23 | 0.63 | 4.2 | 0.015 | 0.20 | 0.55 | 2.0 | fit to the real pathologist data (σ_skill / σ_cutoff reduced from 0.15 / 0.57 for faster fitting) |
+| 2 skilled panel | 9 | 0.70 | 3.0 | 0.015 | 0.55 | 0.20 | 2.0 | smaller panel, raters differ mainly in skill, better performance |
+
+Both variants: slide SD 0.66 (logit recall) and 0.95 (log FP_rate), no slide correlation.
+recall and FP_rate refer to the median rater on a slide with all effects = 0. Swapping σ_skill and
+σ_cutoff keeps the SD of the rater effects (0.585 on logit recall, 1.17 on log FP_rate) and flips
+their correlation from +0.77 (trade-off between recall and FP) to −0.77 (good raters better on both).
+
+**Truths** (marginal, from expected counts per cell = slide × rater, E[TP] = P · recall_cell,
+E[FP] = FP_rate_cell + fp_per_object · P, so there is no 0/0; formulas as `calc_true_metrics()` in
+step 2)
+
+- pooled: metric of the summed expected counts (Recall = Σ E[TP] / Σ P, Precision =
+  Σ E[TP] / Σ (E[TP] + E[FP]), F1 = 2 Σ E[TP] / Σ (P + E[TP] + E[FP])).
+- grouped: mean of the per-cell metrics (each cell same weight).
+- Cells: 20,000 new raters from the rater distribution × the first 10,000 slides of the slide
+  superpopulation of step 1, with own slide effects per variant. Computed one scenario and variant
+  at a time and reduced to one row per rater (sums of the expected counts, per-rater grouped values).
+- **Average pathologist:** over all cells (pathologists and slides), i.e. the population value of the
+  rater population (not the rater with effects = 0). The raters with many FP dominate the pooled
+  sums (FP_rate is lognormal over the raters), hence the 20,000 raters: Monte Carlo SE at most 0.003
+  for pooled and 0.0015 for grouped (bootstrap over the raters in the check; peak memory about 34 GB).
+- **Single pathologist:** per new rater over the slides (20,000 values per scenario and variant; truth
+  for the "single pathologist" prediction interval). Same raters and slides as the average
+  pathologist.
+
+**Seeds** (own offset, no collision with the offsets of `01_seed_offsets.csv`)
+
+- Counts of a dataset: `seed + 10000000 * variant`.
+- Slide effects of the superpopulation: `seed_superpop + 10000000 * variant`.
+- New pathologists of the truth: `seed_superpop + 10000000 * variant + 1`.
+
+**Output** (`simulation/data/`)
+
+- `02_1_pathologist_variants.csv`: parameters of the variants.
+- `02_1_pathologist_observed_data.csv.xz`: one row per slide, rater, dataset and variant: `scenario`,
+  `n_slide`, `rep`, `seed`, `variant`, `slide`, `rater_ID`, `P`, `TP`, `FN`, `FP`.
+- `02_1_truth_average_pathologist.csv`: `scenario`, `variant`, `name`, `averaging`, `truth`.
+- `02_1_truth_new_pathologists.csv.xz`: `scenario`, `variant`, `pathologist`, `name`, `averaging`,
+  `truth`.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+```
+
+# Functions
+```{r}
+# F1-score = harmonic mean of precision and recall (as in the example Rmds).
+# Returns 0 if precision or recall is 0 (paper "Case B").
+calc_F1_score <- function(Precision, Recall) {
+  case_when(
+    Precision == 0 ~ 0, # Set F1-Score to 0 if Precision is 0
+    Recall == 0 ~ 0, # Set F1-Score to 0 if Recall is 0
+    T ~ 2 * (Precision*Recall / (Precision + Recall)) # Normal F1-Score
+  )
+}
+
+# Slide effects on logit recall and log FP_rate, correlated normals (Cholesky, as in step 2)
+draw_slide_effects <- function(slides, sd_slide_difficulty_recall, sd_slide_difficulty_FPrate,
+                               cor_slide_difficulty) {
+  slides |>
+    mutate(
+      z_recall       = rnorm(n()),
+      z_FP_rate      = rnorm(n()),
+      effect_recall  = sd_slide_difficulty_recall * z_recall,
+      effect_FP_rate = sd_slide_difficulty_FPrate *
+        (cor_slide_difficulty * z_recall + sqrt(1 - cor_slide_difficulty^2) * z_FP_rate)
+    ) |>
+    select(-z_recall, -z_FP_rate)
+}
+
+# True recall and expected FP of each cell (slide x rater) from the slide effects and the
+# rater's skill and cutoff
+add_cell_values <- function(df, recall, FP_rate, fp_per_object, rater_FP_scale) {
+  df |>
+    mutate(
+      recall_slide      = plogis(qlogis(recall) + effect_recall + skill + cutoff),
+      FP_expected_slide = FP_rate * exp(effect_FP_rate + rater_FP_scale * (cutoff - skill)) +
+        fp_per_object * P
+    )
+}
+
+# One pathologist dataset: every rater scores every slide (one row per slide x rater)
+simulate_rater_dataset <- function(
+    slides, # Slide dataset with ground truth object counts
+    n_rater, # Number of raters (pathologists)
+    recall, FP_rate, # Performance of the median rater
+    fp_per_object, # FP per true object
+    sd_slide_difficulty_recall, sd_slide_difficulty_FPrate, cor_slide_difficulty, # Slide effects
+    sd_rater_skill, sd_rater_cutoff, rater_FP_scale # Rater effects
+    ) {
+  df_slides <- draw_slide_effects(slides, sd_slide_difficulty_recall, sd_slide_difficulty_FPrate,
+                                  cor_slide_difficulty)
+  df_raters <- tibble(
+    rater_ID = seq_len(n_rater),
+    skill    = rnorm(n_rater, 0, sd_rater_skill),
+    cutoff   = rnorm(n_rater, 0, sd_rater_cutoff)
+  )
+
+  cross_join(df_slides, df_raters) |>
+    add_cell_values(recall, FP_rate, fp_per_object, rater_FP_scale) |>
+    mutate(
+      TP = rbinom(n(), P, recall_slide),
+      FN = P - TP,
+      FP = rpois(n(), FP_expected_slide)
+    ) |>
+    select(slide, rater_ID, P, TP, FN, FP)
+}
+
+# Marginal truth from per-rater sums of the expected counts and per-rater grouped values
+# (formulas as calc_true_metrics() in step 2):
+#   pooled  = metric of the summed expected counts (over the raters of the group)
+#   grouped = mean of the per-cell metrics (every rater has the same slides, so the mean of the
+#             per-rater grouped values = mean over the cells)
+calc_marginal_truth <- function(df) {
+  df |>
+    summarise(
+      Recall_pooled    = sum(TP_sum) / sum(P_sum),
+      Precision_pooled = sum(TP_sum) / sum(TP_sum + FP_sum),
+      F1_pooled        = 2 * sum(TP_sum) / sum(P_sum + TP_sum + FP_sum),
+      across(ends_with("_grouped"), mean)
+    ) |>
+    pivot_longer(matches("_(pooled|grouped)$"),
+                 names_to = c("name", "averaging"), names_sep = "_", values_to = "truth")
+}
+```
+
+# Settings
+```{r}
+offset_pathologists <- 10000000 # seed offset of this step
+n_new_pathologists  <- 20000    # new raters for the truths
+n_truth_slides      <- 10000    # superpopulation slides for the truths
+reps                <- 1:100
+```
+
+# Load slides
+```{r}
+# Pathologist design: scenarios A-C (scenario D of step 1 is only used in the ML design)
+df_slide_scenarios <- read_csv("simulation/data/01_slide_scenarios.csv") |>
+  filter(scenario %in% c("A", "B", "C"))
+df_slides          <- read_csv("simulation/data/01_slides.csv.xz") |>
+  filter(scenario %in% c("A", "B", "C"), n_slide == 40, rep %in% reps)
+df_slides_superpop <- read_csv("simulation/data/01_slides_superpop.csv.xz") |>
+  filter(scenario %in% c("A", "B", "C"))
+```
+
+# Pathologist variants
+```{r}
+df_variants <- tribble(
+  ~variant, ~variant_name,     ~n_rater, ~recall, ~FP_rate, ~fp_per_object, ~sd_slide_difficulty_recall, ~sd_slide_difficulty_FPrate, ~cor_slide_difficulty, ~sd_rater_skill, ~sd_rater_cutoff, ~rater_FP_scale,
+  1,        "data example",    23,       0.63,    4.2,      0.015,          0.66,                        0.95,                        0,                     0.20,            0.55,             2.0,
+  2,        "skilled panel",   9,        0.70,    3.0,      0.015,          0.66,                        0.95,                        0,                     0.55,            0.20,             2.0
+)
+
+df_variants
+```
+
+# Generate counts
+```{r}
+# One simulation per dataset and variant, each with its own seed
+df_sim <- df_slides |>
+  nest(slides = c(slide, group, P)) |>
+  cross_join(df_variants) |>
+  mutate(
+    seed_counts = seed + offset_pathologists * variant,
+    sim = pmap(pick(slides, seed_counts, n_rater:rater_FP_scale), \(slides, seed_counts, ...) {
+      set.seed(seed_counts)
+      simulate_rater_dataset(slides, ...)
+    })
+  ) |>
+  select(scenario, n_slide, rep, seed, variant, sim)
+
+# Counts (without the rater effects)
+df_counts <- df_sim |>
+  unnest(sim) |>
+  select(scenario, n_slide, rep, seed, variant, slide, rater_ID, P, TP, FN, FP)
+```
+
+# Truths
+```{r}
+# Superpopulation slides with own slide effects per scenario and variant
+df_truth_slides <- df_slides_superpop |>
+  nest(slides = c(slide, group, P)) |>
+  left_join(distinct(df_slide_scenarios, scenario, seed_superpop), by = "scenario") |>
+  cross_join(df_variants) |>
+  mutate(
+    seed_slides = seed_superpop + offset_pathologists * variant,
+    slides = pmap(pick(slides, seed_slides, sd_slide_difficulty_recall:cor_slide_difficulty),
+                  \(slides, seed_slides, ...) {
+                    set.seed(seed_slides)
+                    draw_slide_effects(slides, ...)
+                  })
+  )
+
+# Per rater: n_new_pathologists new raters x the first n_truth_slides superpopulation slides,
+# one scenario and variant at a time (only the per-rater summaries are kept)
+df_truth_raters <- df_truth_slides |>
+  mutate(raters = pmap(pick(slides, seed_slides, recall, FP_rate, fp_per_object,
+                            sd_rater_skill, sd_rater_cutoff, rater_FP_scale),
+                       \(slides, seed_slides, recall, FP_rate, fp_per_object,
+                         sd_rater_skill, sd_rater_cutoff, rater_FP_scale) {
+                         set.seed(seed_slides + 1)
+                         tibble(pathologist = seq_len(n_new_pathologists),
+                                skill       = rnorm(n_new_pathologists, 0, sd_rater_skill),
+                                cutoff      = rnorm(n_new_pathologists, 0, sd_rater_cutoff)) |>
+                           cross_join(slides |> filter(slide <= n_truth_slides)) |>
+                           add_cell_values(recall, FP_rate, fp_per_object, rater_FP_scale) |>
+                           mutate(TP_expected = P * recall_slide) |>
+                           group_by(pathologist) |>
+                           summarise(
+                             Recall_grouped    = mean(recall_slide),
+                             Precision_grouped = mean(TP_expected / (TP_expected + FP_expected_slide)),
+                             F1_grouped        = mean(2 * TP_expected / (P + TP_expected + FP_expected_slide)),
+                             TP_sum = sum(TP_expected), P_sum = sum(P), FP_sum = sum(FP_expected_slide)
+                           )
+                       })) |>
+  select(scenario, variant, raters)
+
+# Average pathologist: over all raters (same raters and slides as the single pathologists)
+df_truth_average <- df_truth_raters |>
+  mutate(truth = map(raters, calc_marginal_truth)) |>
+  select(scenario, variant, truth) |>
+  unnest(truth)
+
+# Single pathologist: per rater
+df_truth_new <- df_truth_raters |>
+  mutate(truth = map(raters, \(raters) raters |> group_by(pathologist) |> calc_marginal_truth() |> ungroup())) |>
+  select(scenario, variant, truth) |>
+  unnest(truth)
+```
+
+# Save
+```{r}
+write_csv(df_variants, "simulation/data/02_1_pathologist_variants.csv")
+write_csv(df_counts, "simulation/data/02_1_pathologist_observed_data.csv.xz")
+write_csv(df_truth_average, "simulation/data/02_1_truth_average_pathologist.csv")
+write_csv(df_truth_new, "simulation/data/02_1_truth_new_pathologists.csv.xz")
+```
+
+# Check
+```{r}
+# Number of datasets and raters per scenario and variant
+df_counts |>
+  group_by(scenario, n_slide, variant) |>
+  summarise(datasets = n_distinct(rep), raters_per_dataset = n_distinct(rater_ID),
+            rows = n(), .groups = "drop")
+
+# Monte Carlo SE of the average pathologist: bootstrap over the raters (2000 resamples)
+set.seed(1)
+df_mc_se <- df_truth_raters |>
+  mutate(mc_se = map(raters, \(raters)
+    map(1:2000, \(b) raters |> slice_sample(prop = 1, replace = TRUE) |> calc_marginal_truth()) |>
+      bind_rows() |>
+      group_by(name, averaging) |>
+      summarise(mc_se = sd(truth), .groups = "drop"))) |>
+  select(scenario, variant, mc_se) |>
+  unnest(mc_se)
+
+# Average pathologist (with its Monte Carlo SE) vs. distribution of the single pathologists
+# (median and central 95 %)
+df_truth_new |>
+  group_by(scenario, variant, name, averaging) |>
+  summarise(new_q025 = quantile(truth, 0.025), new_median = median(truth),
+            new_mean = mean(truth), new_q975 = quantile(truth, 0.975), .groups = "drop") |>
+  left_join(df_truth_average |> rename(average = truth), by = c("scenario", "variant", "name", "averaging")) |>
+  left_join(df_mc_se, by = c("scenario", "variant", "name", "averaging")) |>
+  arrange(averaging, variant, name, scenario)
+```

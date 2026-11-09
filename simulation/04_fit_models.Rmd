@@ -1,0 +1,242 @@
+---
+title: "Simulation (paper), step 4: fit the Bayesian models"
+---
+
+Step 4 of the paper simulation: fit the 2 compiled models of step 3 to every dataset of step 2
+(4 scenarios × 2 slide counts × 4 variants × 500 replicates = 16,000 datasets, 32,000 fits) and save
+the fits. Post-processing (estimands, intervals) follows in a later step.
+
+The fits are not part of the repository (about 110 GB, see `fits/README.md`), but their
+diagnostics are.
+
+**Sampler settings**
+
+- 4 chains, run one after another (`cores = 1`); the parallelisation is over the fits.
+- iter 4000, warmup 1000, thin 3: 4 × 1000 = 4000 saved draws per fit.
+- adapt_delta 0.95 for scenarios A-C. Pilot (scenario A, 40 slides, variants 1 and 4, 20 reps, all
+  models): 25 of 240 fits with divergences at the default 0.8, 1 of 240 at 0.95, about 28 % longer.
+- adapt_delta 0.99 for scenario D. Pilot (reps 1-20, adapt_delta 0.95): divergences in 22 of 40
+  (variant 5) and 36 of 40 (variant 7) binomial + Poisson fits (median 2.5-4.5, at most 25 of 4000
+  draws; Rhat <= 1.01). With 0.05-0.1 FP per slide the FP part has almost no data. Test (variant 7,
+  10 fits): 0.99 reduces the divergences from 39 (8 fits) to 7 (3 fits) at about 40 % more time.
+- Diagnostics per fit: divergences, hits of the maximum tree depth, max Rhat, min bulk and tail ESS
+  (over all parameters except `lp__` and `lprior`), and Rhat, bulk and tail ESS of `lp__`
+  (mixing of the joint posterior, often the slowest in hierarchical models).
+- Diagnostics per population-level parameter (intercepts, P_log, SDs, correlation; without the
+  per-slide effects): Rhat, bulk and tail ESS.
+
+**Seeds** (offset from `01_seed_offsets.csv`)
+
+- Stan: `seed + 4000000` with the dataset seed `seed` from the counts file (`seed_base + rep`).
+  All variants and models of a dataset share the seed (the data or the model differ).
+
+**Run**
+
+- Parallel with `purrr::walk()` and `in_parallel()` on mirai daemons (11 workers), one job at a
+  time. The templates are sent to every daemon once (`mirai::everywhere()`) and refitted with
+  `update(recompile = FALSE)`.
+- Jobs replicate by replicate (all scenarios, variants and models of rep 1 first), so a partial run
+  already contains complete replicates.
+- One file per fit. Jobs whose fit file exists are skipped, so the run can be restarted after a
+  crash or run in parts (`reps_to_fit`).
+- Runtime (11 workers): about 7 h per scenario for both models (A-C: binomial + Poisson
+  15 s / 34 s per fit with 40 / 100 slides, multinomial 25 s / 61 s).
+
+**Output** (`simulation/fits/`, about 110 GB for A-D)
+
+- `<model_id>/<scenario>_<n_slide>_v<variant>_r<rep>.rds`: the fit (brmsfit, xz).
+- `diagnostics/<model_id>/<scenario>_<n_slide>_v<variant>_r<rep>.csv`: diagnostics of the fit
+  (or the error message if the fit failed).
+- `diagnostics_parameters/<model_id>/<scenario>_<n_slide>_v<variant>_r<rep>.csv`: diagnostics per
+  population-level parameter.
+- `04_fit_settings.csv`: sampler settings.
+- `04_fit_diagnostics.csv.xz`, `04_fit_diagnostics_parameters.csv.xz`: all diagnostics combined.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(readr)
+```
+
+# Functions
+```{r}
+# Columns for the binomial + Poisson model and the multinomial model (as in step 3)
+prepare_brms_data <- function(df_sim) {
+  df_sim |>
+    mutate(
+      # Binomial + Poisson
+      GroundTruth = TP + FN,    # Sensitivity/recall trials: all true objects (P)
+      # Multinomial
+      N = TP + FN + FP,         # trials: all counted cells
+      Y = cbind(TP = TP, FN = FN, FP = FP),
+      # Object density, centred on the mean of log(P)
+      P_log = as.numeric(scale(log(P), center = TRUE, scale = FALSE))
+    )
+}
+```
+
+# Settings
+```{r}
+n_workers <- 11
+dir_fits  <- "simulation/fits"
+
+# adapt_delta: scenarios A-C; adapt_delta_D: scenario D (few FP per slide, see above)
+fit_settings <- tibble(chains = 4, iter = 4000, warmup = 1000, thin = 3, adapt_delta = 0.95,
+                       adapt_delta_D = 0.99)
+
+# Short model ids for the file names
+df_models <- tribble(
+  ~model,              ~model_id,
+  "Binomial + Poisson", "binomial_poisson",
+  "Multinomial",        "multinomial"
+)
+```
+
+# Load data
+```{r}
+df_seed_offsets <- read_csv("simulation/data/01_seed_offsets.csv")
+df_counts       <- read_csv("simulation/data/02_ML_performance_observed_data.csv.xz")
+
+offset_stan <- df_seed_offsets |> filter(step == "stan") |> pull(offset)
+```
+
+# Jobs
+```{r}
+# Replicates to fit (a subset for a test or a partial run)
+reps_to_fit <- seq_len(max(df_counts$rep))
+
+df_jobs <- df_counts |>
+  filter(rep %in% reps_to_fit) |>
+  nest(data = c(slide, P, TP, FN, FP)) |>
+  mutate(seed_stan = seed + offset_stan) |>
+  cross_join(df_models) |>
+  mutate(
+    file_name        = sprintf("%s_%d_v%d_r%03d", scenario, n_slide, variant, rep),
+    file_fit         = file.path(dir_fits, model_id, paste0(file_name, ".rds")),
+    file_diagnostics = file.path(dir_fits, "diagnostics", model_id, paste0(file_name, ".csv")),
+    file_diagnostics_parameters = file.path(dir_fits, "diagnostics_parameters", model_id,
+                                            paste0(file_name, ".csv"))
+  ) |>
+  # replicate by replicate
+  arrange(rep, scenario, n_slide, variant, model_id) |>
+  # skip fits that already exist
+  filter(!file.exists(file_fit))
+
+nrow(df_jobs)
+```
+
+# Fit
+```{r}
+walk(c(file.path(dir_fits, df_models$model_id),
+       file.path(dir_fits, "diagnostics", df_models$model_id),
+       file.path(dir_fits, "diagnostics_parameters", df_models$model_id)),
+     \(dir) dir.create(dir, recursive = TRUE, showWarnings = FALSE))
+write_csv(fit_settings, file.path(dir_fits, "04_fit_settings.csv"))
+
+# Objects for the daemons are passed as arguments (assignments inside the expression are not kept)
+mirai::daemons(n_workers)
+invisible(mirai::everywhere(
+  {
+    setwd(dir_project)
+    library(dplyr)
+    library(readr)
+    library(brms)
+  },
+  dir_project = getwd(), prepare_brms_data = prepare_brms_data, fit_settings = fit_settings,
+  brms_templates = readRDS("simulation/models/03_brms_templates.rds")
+))
+
+t_start <- Sys.time()
+df_jobs |>
+  split(seq_len(nrow(df_jobs))) |>
+  walk(in_parallel(\(job) {
+  df_diagnostics <- tryCatch({
+    t_fit <- system.time(
+      fit <- update(brms_templates[[job$model]], newdata = prepare_brms_data(job$data[[1]]),
+                    recompile = FALSE, chains = fit_settings$chains, cores = 1,
+                    iter = fit_settings$iter, warmup = fit_settings$warmup, thin = fit_settings$thin,
+                    control = list(adapt_delta = if (job$scenario == "D") fit_settings$adapt_delta_D
+                                                 else fit_settings$adapt_delta),
+                    refresh = 0, seed = job$seed_stan)
+    )[["elapsed"]]
+    # cmdstanr leaves its csv and json files in the temp folder of the worker
+    unlink(list.files(tempdir(), pattern = "\\.(csv|json)$", full.names = TRUE))
+
+    df_nuts <- nuts_params(fit)
+    df_summary_all <- posterior::summarise_draws(posterior::as_draws_array(fit), "rhat", "ess_bulk", "ess_tail")
+
+    # Diagnostics of the population-level parameters (intercepts, P_log, SDs, correlation),
+    # without the per-slide effects
+    job |>
+      select(scenario, n_slide, rep, variant, model, model_id) |>
+      cross_join(df_summary_all |> filter(grepl("^(b|sd|cor)_", variable))) |>
+      write_csv(job$file_diagnostics_parameters)
+    
+    # Quick summary of diagnostics
+    df_summary     <- df_summary_all |> filter(!variable %in% c("lp__", "lprior"))
+    df_summary_lp  <- df_summary_all |> filter(variable == "lp__")
+
+    # Save the fit under a temporary name first, so an interrupted save leaves no fit file
+    t_save <- system.time({
+      saveRDS(fit, paste0(job$file_fit, ".tmp"), compress = "xz")
+      file.rename(paste0(job$file_fit, ".tmp"), job$file_fit)
+    })[["elapsed"]]
+
+    tibble(
+      fit_s              = t_fit,
+      save_s             = t_save,
+      divergences        = sum(df_nuts$Value[df_nuts$Parameter == "divergent__"]),
+      max_treedepth_hits = sum(df_nuts$Value[df_nuts$Parameter == "treedepth__"] >= 10),
+      max_rhat           = max(df_summary$rhat, na.rm = TRUE),
+      min_ess_bulk       = min(df_summary$ess_bulk, na.rm = TRUE),
+      min_ess_tail       = min(df_summary$ess_tail, na.rm = TRUE),
+      rhat_lp            = df_summary_lp$rhat,
+      ess_bulk_lp        = df_summary_lp$ess_bulk,
+      ess_tail_lp        = df_summary_lp$ess_tail,
+      error              = NA_character_
+    )
+  }, error = \(e) tibble(error = conditionMessage(e)))
+
+  job |>
+    select(scenario, n_slide, rep, variant, model, model_id, seed_stan) |>
+    bind_cols(df_diagnostics) |>
+    write_csv(job$file_diagnostics)
+  NULL
+}), .progress = TRUE)
+mirai::daemons(0)
+
+difftime(Sys.time(), t_start, units = "hours")
+```
+
+# Diagnostics
+```{r}
+df_fit_diagnostics <- list.files(file.path(dir_fits, "diagnostics"), pattern = "\\.csv$",
+                                 recursive = TRUE, full.names = TRUE) |>
+  read_csv(col_types = cols(error = col_character()))
+write_csv(df_fit_diagnostics, file.path(dir_fits, "04_fit_diagnostics.csv.xz"))
+
+df_fit_diagnostics_parameters <- list.files(file.path(dir_fits, "diagnostics_parameters"), pattern = "\\.csv$",
+                                            recursive = TRUE, full.names = TRUE) |>
+  read_csv()
+write_csv(df_fit_diagnostics_parameters, file.path(dir_fits, "04_fit_diagnostics_parameters.csv.xz"))
+
+# Failed fits
+df_fit_diagnostics |> filter(!is.na(error))
+
+# Summary per model and variant
+df_fit_diagnostics |>
+  filter(is.na(error)) |>
+  group_by(model, variant) |>
+  summarise(fits = n(), fits_with_div = sum(divergences > 0), treedepth_hits = sum(max_treedepth_hits),
+            rhat_gt_1.01 = sum(max_rhat > 1.01), max_rhat = max(max_rhat),
+            min_ess_bulk = min(min_ess_bulk), min_ess_tail = min(min_ess_tail),
+            max_rhat_lp = max(rhat_lp), min_ess_bulk_lp = min(ess_bulk_lp),
+            mean_fit_s = mean(fit_s), .groups = "drop")
+
+# Summary per model and population-level parameter
+df_fit_diagnostics_parameters |>
+  group_by(model, variable) |>
+  summarise(fits = n(), rhat_gt_1.01 = sum(rhat > 1.01), max_rhat = max(rhat),
+            min_ess_bulk = min(ess_bulk), min_ess_tail = min(ess_tail), .groups = "drop")
+```
